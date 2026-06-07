@@ -1,0 +1,18 @@
+# OS / エディタ
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# ビルド成果物・作業用一時ファイル
+*.bin
+*.hex
+*.lst
+*.map
+*.o
+*.rel
+*.tmp
+build/
+tmp/
