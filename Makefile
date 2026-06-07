@@ -78,7 +78,7 @@ $(BUILD)/bios.p: src/bios/bios.asm | $(BUILD)
 	$(AS) -D origin=$(BIOS_ORG) -o $(BUILD)/bios.p src/bios/bios.asm
 
 $(BUILD)/bios.bin: $(BUILD)/bios.p
-	$(P2BIN) $(BUILD)/bios.p $(BUILD)/bios.bin
+	$(P2BIN) $(BUILD)/bios.p $(BUILD)/bios.bin -r '$$e900-$$efff'
 
 bios: $(BUILD)/bios.bin
 	@echo "BIOS ビルド完了 (BIOS_ORG=$(BIOS_ORG))"
