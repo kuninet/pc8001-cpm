@@ -14,7 +14,7 @@ EMU_PYTHONPATH := external/z80
 
 BUILD := build
 
-.PHONY: all setup smoke clean fetch-cpm cpm check-setup check-cpm
+.PHONY: all setup smoke clean fetch-cpm cpm check-setup check-cpm bios
 
 all: smoke
 
@@ -70,6 +70,18 @@ $(BUILD)/ccp.bin: $(CPM_SRC)/ccp.asm | $(BUILD)
 $(BUILD)/bdos.bin: $(CPM_SRC)/bdos.asm | $(BUILD)
 	$(AS) -D origin=$(BDOS_ORG) -o $(BUILD)/bdos.p $<
 	$(P2BIN) -l '$$00' -r '$(BDOS_RANGE)' $(BUILD)/bdos.p $@
+
+# --- BIOS ---
+BIOS_ORG ?= 0E900h
+
+$(BUILD)/bios.p: src/bios/bios.asm | $(BUILD)
+	$(AS) -D origin=$(BIOS_ORG) -o $(BUILD)/bios.p src/bios/bios.asm
+
+$(BUILD)/bios.bin: $(BUILD)/bios.p
+	$(P2BIN) $(BUILD)/bios.p $(BUILD)/bios.bin
+
+bios: $(BUILD)/bios.bin
+	@echo "BIOS ビルド完了 (BIOS_ORG=$(BIOS_ORG))"
 
 clean:
 	rm -rf $(BUILD)
