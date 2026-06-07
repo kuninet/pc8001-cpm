@@ -9,12 +9,13 @@
 
 AS      := asl
 P2BIN   := p2bin
+P2HEX   := p2hex
 PY      := .venv/bin/python
 EMU_PYTHONPATH := external/z80
 
 BUILD := build
 
-.PHONY: all setup smoke clean fetch-cpm cpm check-setup check-cpm bios
+.PHONY: all setup smoke clean fetch-cpm cpm check-setup check-cpm bios loader
 
 all: smoke
 
@@ -82,6 +83,19 @@ $(BUILD)/bios.bin: $(BUILD)/bios.p
 
 bios: $(BUILD)/bios.bin
 	@echo "BIOS ビルド完了 (BIOS_ORG=$(BIOS_ORG))"
+
+# --- ブートローダ ---
+$(BUILD)/loader.p: src/loader/loader.asm | $(BUILD)
+	$(AS) -o $(BUILD)/loader.p src/loader/loader.asm
+
+$(BUILD)/loader.bin: $(BUILD)/loader.p
+	$(P2BIN) $(BUILD)/loader.p $(BUILD)/loader.bin -r '$$6000-$$7fff'
+
+$(BUILD)/loader.hex: $(BUILD)/loader.p
+	$(P2HEX) $(BUILD)/loader.p $(BUILD)/loader.hex
+
+loader: $(BUILD)/loader.bin $(BUILD)/loader.hex
+	@echo "ローダ ビルド完了 (loader.bin=$(shell wc -c < $(BUILD)/loader.bin)B, loader.hex=$(shell wc -c < $(BUILD)/loader.hex)B)"
 
 clean:
 	rm -rf $(BUILD)
