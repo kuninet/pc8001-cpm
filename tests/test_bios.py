@@ -309,11 +309,17 @@ class TestDummyRoutines:
         result = pc.run_until_halt()
         assert result is True, "HALT に到達しなかった"
 
-    def test_conin_returns_eof(self, pc_with_bios):
-        """CONIN(vec3=0xE909): A==0x1A(EOF)。"""
+    def test_conin_with_key(self, pc_with_bios):
+        """CONIN(vec3=0xE909): キー押下済みなら A==押下文字。
+        ダミーマッピング: ASCII 0x41('A')は行2列1 → 行0x41=0x20+2*8+1=0x31? ... 確認。
+        0x20 + row*8 + col = 0x41 → row*8+col = 0x21=33 → row=4,col=1
+        """
         pc = pc_with_bios
+        # 0x41 = 0x20 + 4*8 + 1: 行4, 列1 にキーを押す
+        pc.set_key_matrix(4, 1, True)
         self._call_and_halt(pc, vec(3))
-        assert pc.cpu.a == 0x1A, f"CONIN: A=0x{pc.cpu.a:02X} (expected 0x1A)"
+        pc.clear_keys()
+        assert pc.cpu.a == 0x41, f"CONIN: A=0x{pc.cpu.a:02X} (expected 0x41='A')"
 
     def test_reader_returns_eof(self, pc_with_bios):
         """READER(vec7=0xE915): A==0x1A(EOF)。"""
