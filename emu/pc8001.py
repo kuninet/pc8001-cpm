@@ -46,7 +46,10 @@ class PC8001:
         self.port30: int = 0x00          # 汎用ポート
         self.crtc_param: list[int] = []  # CRTCパラメータ(ポート0x50)
         self.crtc_cmd: list[int] = []    # CRTCコマンド(ポート0x51)
-        self.io_out_log: dict[int, int] = {}  # その他OUTログ
+        self.io_out_log: dict[int, int] = {}  # その他OUTログ(最終値のみ)
+        # μPD8257 DMA(Ch2)送出列を順序付きで記録(ポート0x64/0x65/0x68)。
+        # 同一ポートへの複数バイト送出(アドレス下位→上位等)を回帰検証するため。
+        self.dma_log: list[tuple[int, int]] = []  # (ポート, 値)
 
         # キーボードマトリクス(0x00-0x09行、未押下=0xFF)
         self.kbd_rows: list[int] = [0xFF] * 10
@@ -118,6 +121,10 @@ class PC8001:
             self.crtc_param.append(v)
         elif p == 0x51:
             self.crtc_cmd.append(v)
+        elif p in (0x64, 0x65, 0x68):
+            # μPD8257 DMA(Ch2): 送出順を保持して記録(最終値も io_out_log に)
+            self.dma_log.append((p, v))
+            self.io_out_log[p] = v
         elif p == 0xFF:
             # 8255 制御ワード
             self.ppi_ctl = v

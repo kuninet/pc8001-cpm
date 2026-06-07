@@ -327,12 +327,10 @@ class TestDummyRoutines:
 
     def test_conin_with_key(self, pc_with_bios):
         """CONIN(vec3): キー押下済みなら A==押下文字。
-        ダミーマッピング: ASCII 0x41('A')は行2列1 → 行0x41=0x20+2*8+1=0x31? ... 確認。
-        0x20 + row*8 + col = 0x41 → row*8+col = 0x21=33 → row=4,col=1
+        doc/キーボードマトリクス.md: 'A' = ポート02h D1 → set_key_matrix(2, 1)。
         """
         pc = pc_with_bios
-        # 0x41 = 0x20 + 4*8 + 1: 行4, 列1 にキーを押す
-        pc.set_key_matrix(4, 1, True)
+        pc.set_key_matrix(2, 1, True)   # 'A' = 02h D1
         self._call_and_halt(pc, vec(3))
         pc.clear_keys()
         assert pc.cpu.a == 0x41, f"CONIN: A=0x{pc.cpu.a:02X} (expected 0x41='A')"

@@ -96,15 +96,11 @@ WBOOT:					; == origin+0x45 ==
 ;   CRTC初期化 → VRAMクリア → サインオン → RST7スタブ設置 → HALT
 ;--------------------------------------------------------------
 BOOT_BODY:
-	; CRTC 初期化スタブ
-	; TODO: ICW SCREEN FORMAT 詳細は実機確認 (#39 でCP-3確認)
-	; 現状の OUT (0x51), 0x00 のみでは実機μPD3301の正しい初期化に
-	; ならない可能性が高い(SCREEN FORMAT パラメータ未送出)。
-	; 80桁モード切替/カーソル設定/DMA設定/OCWは未対応。
-	; 実機/MAME での検証は #39 (CP-3) で確定する。
 	DI				; 割り込み禁止
-	LD	A, 00h
-	OUT	(51h), A		; ICW: RESET (スタブ値)
+
+	; CRTC(μPD3301)+ DMA(μPD8257 Ch2)初期化
+	;   doc/CRTC初期化.md の初期化シーケンス6ステップを実行する。
+	CALL	CRTC_INIT
 
 	; VRAM クリア
 	CALL	CLS
@@ -398,10 +394,12 @@ CALC_VRAM_ADDR:
 
 ;--------------------------------------------------------------
 ; CLS: 画面クリア
-;   表示部(各行80B) = 0x20、アトリビュート部(各行40B) = 0x00
+;   表示部(各行80B) = 0x20、アトリビュート部(各行40B) = 既定属性。
 ;   0xF300〜0xFEB7 (25行 × 120B = 3000B)
 ;   実装: 全3000バイトをまず 0x20 で埋め、
-;          各行のアトリビュート40バイト(+80〜+119)を0x00で上書き
+;          各行のアトリビュート40バイト(+80〜+119)を既定属性で上書き。
+;   既定属性(doc/アトリビュート.md): 各行 00h,0E8h,50h,00h,50h,00h,...
+;     先頭組=[距離0][白キャラクタ0xE8]、以降=[0x50][0x00]で安全埋め。
 ;--------------------------------------------------------------
 CLS:
 	PUSH	AF
@@ -420,20 +418,18 @@ CLS:
 	LD	BC, 0BB7h		; 残り 3000-1 = 2999 = 0xBB7 バイト
 	LDIR				; src=HL(0xF300), dst=DE(0xF301): 連鎖コピー
 
-	; 各行のアトリビュート部(+80〜+119)を 0x00 で上書き
-	; LDIR で 0xF350→0xF351, 0x40-1バイト を25行分
+	; 各行のアトリビュート部(+80〜+119)を既定属性テンプレートで上書き。
+	; ATTR_TMPL(40B) を 各行先頭(0xF350から120B間隔)へ LDIR コピー。
 	LD	B, 25			; 25行
 	LD	HL, 0F350h		; 行0のアトリビュート先頭 = 0xF300+80
 CLS_ATTR_ROW:
 	PUSH	BC
-	PUSH	HL
-	LD	(HL), 00h		; 先頭1バイトを0x00
-	LD	D, H
-	LD	E, L
-	INC	DE
-	LD	BC, 39			; 残り 40-1 = 39 バイト
-	LDIR				; アトリビュート40バイトを 0x00 でクリア
-	POP	HL
+	PUSH	HL			; HL = dst(この行のアトリビュート先頭)
+	EX	DE, HL			; DE = dst
+	LD	HL, ATTR_TMPL		; HL = src(テンプレート)
+	LD	BC, 40			; 40バイト
+	LDIR				; テンプレートをコピー
+	POP	HL			; HL = dst先頭に復元
 	; 次行のアトリビュート先頭 = 現在 HL + 120
 	LD	DE, 120
 	ADD	HL, DE
@@ -445,6 +441,24 @@ CLS_ATTR_ROW:
 	POP	BC
 	POP	AF
 	RET
+
+;--------------------------------------------------------------
+; ATTR_TMPL: CLS 用アトリビュート既定テンプレート(40バイト)
+;   00h,0E8h = 距離0・白キャラクタ(0xE8)
+;   以降 0x50,0x00 を19組(=38バイト)で安全に埋める。
+;--------------------------------------------------------------
+ATTR_TMPL:
+	DB	00h, 0E8h		; 距離0 → 白キャラクタ (2B)
+	; 残り38バイト = [0x50,0x00] × 19組
+	DB	50h, 00h, 50h, 00h, 50h, 00h, 50h, 00h, 50h, 00h	; 10B
+	DB	50h, 00h, 50h, 00h, 50h, 00h, 50h, 00h, 50h, 00h	; 10B
+	DB	50h, 00h, 50h, 00h, 50h, 00h, 50h, 00h, 50h, 00h	; 10B
+	DB	50h, 00h, 50h, 00h, 50h, 00h, 50h, 00h		; 8B
+ATTR_TMPL_END:
+	; サイズ検証(40Bでなければアセンブルエラー)
+	if	(ATTR_TMPL_END - ATTR_TMPL) <> 40
+	error	"ATTR_TMPL must be exactly 40 bytes"
+	endif
 
 ;--------------------------------------------------------------
 ; SCROLL: ソフトウェアスクロール
@@ -491,22 +505,20 @@ SCROLL_ATTR:
 ;   行0〜9 を順にスキャン、押下キーをASCII変換して返す
 ;   戻り: A = ASCII文字 (0=押下なし)
 ;
-;   ダミーマッピング(実機確定は要更新):
-;     ASCII 0x20〜0x7E を 10行×8列=80キーへ線形マップ
-;     行(0〜9)×8 + 列(0〜7) → ASCII = 0x20 + row*8 + col
-;
-;   SHIFT検出: 行0 bit6=0 で SHIFT押下
-;   CTRL検出:  行0 bit7=0 で CTRL押下
-;   ※ マトリクスダミー、実機確定は要更新
+;   ASCII変換は doc/キーボードマトリクス.md のマトリクス表に基づく
+;   テーブル変換(SCAN_TO_ASCII)。
+;   SHIFT検出: 08h D6=0 で SHIFT押下
+;   CTRL検出:  08h D7=0 で CTRL押下
+;   極性: 0=押下(アクティブロー)。反転しない。
 ;--------------------------------------------------------------
 SCAN_KBD:
 	PUSH	BC
 	PUSH	DE
 	PUSH	HL
 
-	; 行0を読んでSHIFT/CTRL状態を保存
-	IN	A, (0)
-	LD	D, A			; D = 行0の値(SHIFT/CTRL用)
+	; 修飾キー行(08h)を読んで SHIFT(D6)/CTRL(D7) 状態を保存
+	IN	A, (8)
+	LD	D, A			; D = 08hの値(SHIFT=D6, CTRL=D7)
 
 	; 行0〜9 を全行スキャン (B=行番号, C=列番号)
 	LD	B, 0			; B = 行番号
@@ -610,39 +622,62 @@ SRR_9:	IN	A, (9)
 	RET
 
 ;--------------------------------------------------------------
-; SCAN_TO_ASCII: 行B/列Cからダミーマッピングで ASCII を計算
-;   戻り: A = ASCII (0=範囲外)
-;   行0の列6(SHIFT)/列7(CTRL)は修飾キー専用のため0を返す
+; SCAN_TO_ASCII: 行B/列Cから KEYTBL を引いて 基本(非SHIFT)ASCII を返す
+;   入力: B=行番号(0-9, =ポート番号), C=列番号(0-7, =ビット番号)
+;   戻り: A = 基本ASCII (0=未割当/修飾キー)
+;   破壊: AF, HL (BCは保存)
+;   index = B*8 + C, A = (KEYTBL + index)
 ;--------------------------------------------------------------
 SCAN_TO_ASCII:
-	; 行0の列6(SHIFT)/列7(CTRL)は修飾キー専用: 除外
-	LD	A, B
-	OR	A
-	JR	NZ, STA_CALC	; 行0以外はそのまま計算
-	LD	A, C
-	CP	6
-	JR	NC, STA_EXCL	; 列6以上(=6,7)は修飾キー→除外
-STA_CALC:
+	PUSH	BC
+	; index = B*8 + C
 	LD	A, B
 	ADD	A, A
 	ADD	A, A
 	ADD	A, A		; A = B*8
 	ADD	A, C		; A = B*8 + C
-	ADD	A, 20h		; A = 0x20 + B*8 + C
-	CP	7Fh
-	JR	C, STA_OK	; < 0x7F → 有効
-STA_EXCL:
-	XOR	A		; 範囲外/修飾キー: 無効
-STA_OK:
+	; HL = KEYTBL + index
+	LD	HL, KEYTBL
+	LD	C, A
+	LD	B, 0
+	ADD	HL, BC
+	LD	A, (HL)		; A = 基本ASCII
+	POP	BC
 	RET
 
 ;--------------------------------------------------------------
+; KEYTBL: 行(=ポート0-9)×列(=ビット0-7) → 基本(非SHIFT)ASCII テーブル(80B)
+;   doc/キーボードマトリクス.md のマトリクス表に基づく。
+;   英字は大文字を基本値とし、SHIFT で小文字へトグル(SCAN_MOD)。
+;   0 = 未割当 / 修飾キー(SHIFT/CTRL/カナ/GRPH/ファンクション等)。
+;   ※ 一部キートップ刻印・SHIFT記号は実機(#39)で要確定。
+;--------------------------------------------------------------
+KEYTBL:
+	DB	030h, 031h, 032h, 033h, 034h, 035h, 036h, 037h	; 00h: 0-7
+	DB	038h, 039h, 02Ah, 02Bh, 03Dh, 02Ch, 02Eh, 00Dh	; 01h: 8 9 * + = , . RET
+	DB	040h, 041h, 042h, 043h, 044h, 045h, 046h, 047h	; 02h: @ A B C D E F G
+	DB	048h, 049h, 04Ah, 04Bh, 04Ch, 04Dh, 04Eh, 04Fh	; 03h: H I J K L M N O
+	DB	050h, 051h, 052h, 053h, 054h, 055h, 056h, 057h	; 04h: P Q R S T U V W
+	DB	058h, 059h, 05Ah, 05Bh, 05Ch, 05Dh, 05Eh, 03Dh	; 05h: X Y Z [ \ ] ^ =
+	DB	030h, 031h, 032h, 033h, 034h, 035h, 036h, 037h	; 06h: テンキー 0-7
+	DB	038h, 039h, 02Ah, 02Bh, 03Bh, 03Ah, 02Fh, 05Fh	; 07h: テンキー 8 9 * + ; : / _
+	DB	000h, 000h, 000h, 07Fh, 000h, 000h, 000h, 000h	; 08h: 修飾(D3=INS/DEL=0x7F)
+	DB	000h, 000h, 000h, 000h, 000h, 000h, 020h, 01Bh	; 09h: STOP f1-5 SPACE ESC
+KEYTBL_END:
+	if	(KEYTBL_END - KEYTBL) <> 80
+	error	"KEYTBL must be exactly 80 bytes"
+	endif
+
+;--------------------------------------------------------------
 ; SCAN_MOD: CTRL/SHIFT 修飾を A に適用
-;   入力: A = ASCII (0x20〜0x7E), D = 行0の値
+;   入力: A = 基本ASCII, D = 08hの値(SHIFT=D6, CTRL=D7; 押下=0)
 ;   戻り: A = 変換後 ASCII
+;   英字(A-Z): CTRL→0x01-0x1A, SHIFT→小文字へトグル。
+;   ※ 数字・記号の SHIFT 変換(例: 2→@ 等)はキートップ未確定のため
+;     現状は基本値を通す(必要時に例外表で対応; 実機 #39 で確定)。
 ;--------------------------------------------------------------
 SCAN_MOD:
-	; CTRL 確認: bit7=0 → CTRL押下
+	; CTRL 確認: D7=0 → CTRL押下
 	BIT	7, D
 	JR	NZ, SMOD_NO_CTRL
 	; CTRL変換: アルファベットを 0x01〜0x1A に
@@ -660,7 +695,7 @@ SMOD_CTRL_CHK:
 	RET
 
 SMOD_NO_CTRL:
-	; SHIFT 確認: bit6=0 → SHIFT押下
+	; SHIFT 確認: D6=0 → SHIFT押下
 	BIT	6, D
 	RET	NZ		; SHIFT未押下: そのまま
 	; SHIFT: 大小文字トグル
@@ -697,6 +732,84 @@ PUNCH:
 READER:
 	LD	A, 1Ah
 	RET
+
+;--------------------------------------------------------------
+; CRTC_INIT: μPD3301(CRTC) + μPD8257(DMA Ch2) 初期化
+;   doc/CRTC初期化.md の初期化シーケンス(6ステップ)を実行する。
+;   80桁×25行・200ライン・トランスペアレントカラー。
+;   破壊: AF, B, HL
+;
+;   1. OUT(51h),00h           ICW RESET
+;   2. DMA設定: (port,value)テーブル CRTC_DMA_TBL を順送出
+;        64h<-00h,64h<-0F3h, 65h<-0B7h,65h<-4Bh, 68h<-84h
+;   3. FORMAT1-5: 50h へ 4Eh,18h,67h,0DEh,53h を順送出
+;   4. OUT(51h),43h           OCW3 SET INTERRUPT MASK
+;   5. OUT(51h),20h           OCW2 START DISPLAY
+;   6. OUT(40h),00h           /CLDS=0(表示有効化)
+;      ※ 0x40 の他ビット(CMT/BEEP等)の実機既定は未確定。
+;        d3=0 のみ意図し残りは 0x00 でスタブ。実機(#39)で確定する。
+;--------------------------------------------------------------
+CRTC_INIT:
+	; 手順1: ICW RESET
+	XOR	A
+	OUT	(51h), A		; OUT(51h),00h
+
+	; 手順2: DMA(μPD8257 Ch2)設定 — (port,value)テーブルを順送出
+	LD	HL, CRTC_DMA_TBL
+	LD	B, CRTC_DMA_LEN		; 組数(=5)
+CRTC_DMA_LOOP:
+	LD	C, (HL)			; C = ポート番号
+	INC	HL
+	LD	A, (HL)			; A = 送出値
+	INC	HL
+	OUT	(C), A			; OUT(C),A
+	DJNZ	CRTC_DMA_LOOP
+
+	; 手順3: ICW SCREEN FORMAT 1-5 を 50h へ順送出
+	LD	HL, CRTC_FMT_TBL
+	LD	B, CRTC_FMT_LEN		; バイト数(=5)
+CRTC_FMT_LOOP:
+	LD	A, (HL)
+	OUT	(50h), A		; OUT(50h),FORMATn
+	INC	HL
+	DJNZ	CRTC_FMT_LOOP
+
+	; 手順4: OCW3 SET INTERRUPT MASK
+	LD	A, 43h
+	OUT	(51h), A
+	; 手順5: OCW2 START DISPLAY
+	LD	A, 20h
+	OUT	(51h), A
+	; 手順6: /CLDS=0(表示有効化)。他ビットは実機(#39)で確定。
+	XOR	A
+	OUT	(40h), A		; OUT(40h),00h (d3=0 スタブ)
+	RET
+
+;--------------------------------------------------------------
+; CRTC_DMA_TBL: μPD8257 Ch2 設定テーブル (ポート,値) × 5組
+;   64h<-00h/0F3h(DMAアドレス0xF300), 65h<-0B7h/4Bh(カウント2999+Rd),
+;   68h<-84h(オートロード+Ch2有効)
+;--------------------------------------------------------------
+CRTC_DMA_TBL:
+	DB	64h, 00h		; DMAアドレス下位
+	DB	64h, 0F3h		; DMAアドレス上位 (=0xF300)
+	DB	65h, 0B7h		; ターミナルカウント下位 (2999=0x0BB7)
+	DB	65h, 4Bh		; カウント上位+リードサイクル(Wr=1)
+	DB	68h, 84h		; モードセット: AL=1 + EN2=1
+CRTC_DMA_END:
+CRTC_DMA_LEN	equ	(CRTC_DMA_END - CRTC_DMA_TBL) / 2
+
+;--------------------------------------------------------------
+; CRTC_FMT_TBL: ICW SCREEN FORMAT 1-5 (50h へ順送出)
+;--------------------------------------------------------------
+CRTC_FMT_TBL:
+	DB	4Eh			; FORMAT1: 80桁・DMAバースト
+	DB	18h			; FORMAT2: 25行・ブリンク00
+	DB	67h			; FORMAT3: 8ライン/文字・反転ブロックカーソル
+	DB	0DEh			; FORMAT4: 垂直帰線7行・水平帰線32文字
+	DB	53h			; FORMAT5: トランスペアレントカラー・20アトリ/行
+CRTC_FMT_END:
+CRTC_FMT_LEN	equ	CRTC_FMT_END - CRTC_FMT_TBL
 
 SIGNON:
 	DB	'PC-8001 CP/M 2.2 BIOS', 0
