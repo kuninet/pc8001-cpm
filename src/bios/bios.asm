@@ -1,19 +1,40 @@
 ;==============================================================
 ; PC-8001 CP/M 2.2 BIOS
 ; doc/設計/03_BIOS構成.md, doc/設計/04_コンソール.md 準拠
-;   - BIOS_ORG = 0E900h
+;   - 配置/CCP/BDOSアドレス・LBAはすべて Makefile から -D で受領する
+;     (origin=BIOS_ORG, CCP_ORG, BDOS_ORG, CCP_LBA, BDOS_LBA)。
+;   - 数値直書きを排除し、メモリ配置は BIOS_BLOCKS の単一パラメータから導出。
 ;   - ジャンプテーブル: 17エントリ × 3バイト = 51バイト
-;   - コンソール: テキストVRAM 0F300h, ADM-3A相当
+;   - コンソール: テキストVRAM 0F300h(固定), ADM-3A相当
 ;
-; ビルド:
-;   asl -D origin=0E900h -o build/bios.p src/bios/bios.asm
-;   p2bin build/bios.p build/bios.bin
+; ビルド(例 BIOS_BLOCKS=9):
+;   asl -D origin=0E100h -D CCP_ORG=0CB00h -D BDOS_ORG=0D300h \
+;       -D CCP_LBA=9 -D BDOS_LBA=13 -o build/bios.p src/bios/bios.asm
+;   p2bin build/bios.p build/bios.bin -r '$E100-$F2FF'
 ;==============================================================
 	cpu	z80
 
+; --- 配置パラメータ(未指定時のデフォルト = BIOS_BLOCKS=9 相当)---
 	ifndef	origin
-origin	equ	0E900h
+origin	equ	0E100h
 	endif
+	ifndef	CCP_ORG
+CCP_ORG	equ	0CB00h
+	endif
+	ifndef	BDOS_ORG
+BDOS_ORG	equ	0D300h
+	endif
+	ifndef	CCP_LBA
+CCP_LBA	equ	9
+	endif
+	ifndef	BDOS_LBA
+BDOS_LBA	equ	13
+	endif
+
+; BIOS専用スタック。テキストVRAM(0xF300-0xFEB7)の上の空き領域に置く。
+;   CLS が VRAM全域(0xF300-0xFEB7)をクリアするため、スタックはその上(0xFF00)に
+;   退避する。CCP/BDOS/BIOS本体のいずれも破壊しない安全領域。
+BIOS_STACK	equ	0FF00h
 
 	org	origin
 
@@ -40,34 +61,35 @@ origin	equ	0E900h
 	JP	SECTRAN		; 16: SECTRAN 論理→物理セクタ変換
 
 ;--------------------------------------------------------------
-; BOOT: コールドブート (0E933h 固定)
-;   スタックポインタ設定 → CRTC初期化 → VRAMクリア → サインオン → HALT
-;   TODO: 実機ではCCPへ #35/#37
+; BOOT: コールドブート (origin+0x33 固定)
+;   スタックポインタ設定 → CRTC初期化 → VRAMクリア → サインオン → CCPへ
 ;   ※ BOOT本体は WBOOT の後(BOOT_BODY)に配置
-;      ジャンプテーブル直後のアドレス制約(0xE933/0xE945)を守るため
+;      ジャンプテーブル直後のアドレス制約(origin+0x33 / origin+0x45)を守るため
+;   スタックは VRAM領域(BIOS_STACK)を使う。実機ではBOOT時点でCCP/BDOSが
+;   ロード済みのため、それらを破壊しない VRAM領域に退避する。
 ;--------------------------------------------------------------
-BOOT:					; == 0E933h ==
-	LD	SP, 0DF00h		; スタックポインタ設定 (3B: 0xE933-0xE935)
-	JP	BOOT_BODY		; BOOT本体へ (3B: 0xE936-0xE938)
-	NOP				; パディング (1B: 0xE939)
-	NOP				; パディング (1B: 0xE93A)
-	NOP				; パディング (1B: 0xE93B)
-	NOP				; パディング (1B: 0xE93C)
-	NOP				; パディング (1B: 0xE93D)
-	NOP				; パディング (1B: 0xE93E)
-	NOP				; パディング (1B: 0xE93F)
-	NOP				; パディング (1B: 0xE940)
-	NOP				; パディング (1B: 0xE941)
-	NOP				; パディング (1B: 0xE942)
-	NOP				; パディング (1B: 0xE943)
-	NOP				; パディング (1B: 0xE944)
+BOOT:					; == origin+0x33 ==
+	LD	SP, BIOS_STACK		; スタックポインタ設定 (3B: origin+0x33..0x35)
+	JP	BOOT_BODY		; BOOT本体へ (3B: origin+0x36..0x38)
+	NOP				; パディング (1B: origin+0x39)
+	NOP				; パディング (1B: origin+0x3A)
+	NOP				; パディング (1B: origin+0x3B)
+	NOP				; パディング (1B: origin+0x3C)
+	NOP				; パディング (1B: origin+0x3D)
+	NOP				; パディング (1B: origin+0x3E)
+	NOP				; パディング (1B: origin+0x3F)
+	NOP				; パディング (1B: origin+0x40)
+	NOP				; パディング (1B: origin+0x41)
+	NOP				; パディング (1B: origin+0x42)
+	NOP				; パディング (1B: origin+0x43)
+	NOP				; パディング (1B: origin+0x44)
 
 ;--------------------------------------------------------------
-; WBOOT: ウォームブート (0E945h 固定)
+; WBOOT: ウォームブート (origin+0x45 固定)
 ;   CCP/BDOS を SD から再ロードしてゼロページを再設定、CCP へジャンプ
 ;--------------------------------------------------------------
-WBOOT:					; == 0E945h ==
-	JP	WBOOT_BODY		; WBOOT本体へ (3B: 0xE945-0xE947)
+WBOOT:					; == origin+0x45 ==
+	JP	WBOOT_BODY		; WBOOT本体へ (3B: origin+0x45..0x47)
 
 ;--------------------------------------------------------------
 ; BOOT_BODY: BOOT本体 (WBOOTの後に配置)
@@ -102,8 +124,8 @@ BOOT_LOOP:
 	JR	BOOT_LOOP
 BOOT_DONE:
 	; ローダがゼロページ/CCP/BDOSをロード済み、WBOOTがワーク初期化を行う前提で
-	; BOOT は CCP(0xD300)へ直接ジャンプする。
-	JP	0D300h
+	; BOOT は CCP(CCP_ORG)へ直接ジャンプする。
+	JP	CCP_ORG
 
 ;--------------------------------------------------------------
 ; CONST: コンソール入力状態確認
@@ -694,8 +716,9 @@ KEYBUF:
 	DB	0
 
 ;==============================================================
-; ウォームブート補助ルーチン群 (0xEBE6-0xEBFF)
-;   KEYBUF(0xEBE5)の後、SDジャンプテーブル(0xEC00)の前に配置
+; ウォームブート補助ルーチン群
+;   KEYBUF の後、SDブロックドライバ固定ジャンプテーブルの前に連続配置。
+;   (配置アドレスは origin から連続レイアウトで決まる)
 ;==============================================================
 
 ;--------------------------------------------------------------
@@ -727,10 +750,11 @@ FDB_DONE:
 	RET
 
 ;==============================================================
-; SDブロックドライバ(#33)固定ジャンプテーブル
-;   SD_INIT_VEC  = 0EC00h  (CALL 0EC00h でSD初期化)
-;   SD_READ_VEC  = 0EC03h  (CALL 0EC03h でブロック読込)
-;   SD_WRITE_VEC = 0EC06h  (CALL 0EC06h でブロック書込)
+; SDブロックドライバ(#33)ジャンプテーブル
+;   SD_INIT_VEC  : SD初期化
+;   SD_READ_VEC  : ブロック読込
+;   SD_WRITE_VEC : ブロック書込
+;   (シンボル参照で呼ぶ。配置は origin から連続レイアウトで決まる)
 ;==============================================================
 
 SD_INIT_VEC:
@@ -1154,18 +1178,20 @@ SD_WR_ARG:
 	DB	0FFh			; CRC
 
 ;--------------------------------------------------------------
-; ゼロページ設定データ (固定アドレス 0xEDEF)
-;   SDコマンドテーブル末尾(0xEDEE)の直後、SD_BUF(0xEE00)の前
+; ゼロページ設定データ
+;   SDコマンドテーブル末尾の直後、SD_BUF の前に配置(連続レイアウト)。
 ;   WBOOTのゼロページ初期化LDIR処理から参照する。
+;   WBOOTベクタ = origin+3(ジャンプテーブルの JP WBOOT エントリ)。
+;   BDOSエントリ = BDOS_ORG+6。
 ;--------------------------------------------------------------
 
 WB_ZP_DATA:
-	DB	0C3h, 03h, 0E9h		; 0x0000: JP 0xE903 (WBOOT)
+	DB	0C3h, (origin+3)&0FFh, ((origin+3)>>8)&0FFh	; 0x0000: JP origin+3 (WBOOT)
 	DB	00h, 00h		; 0x0003-0x0004: IOBYTE=0, ドライブ=A
-	DB	0C3h, 06h, 0DBh		; 0x0005: JP 0xDB06 (BDOS)
+	DB	0C3h, (BDOS_ORG+6)&0FFh, ((BDOS_ORG+6)>>8)&0FFh	; 0x0005: JP BDOS_ORG+6 (BDOS)
 
 ;--------------------------------------------------------------
-; SD用データ領域 (固定アドレス 0xEE00)
+; SD用データ領域 (SDコマンドテーブル末尾の直後に連続配置)
 ;--------------------------------------------------------------
 
 SD_BUF:
@@ -1175,7 +1201,7 @@ SD_CCS:
 	DB	0			; カード種別 (0=SDSC, 非0=SDHC)
 
 ;==============================================================
-; ディスク層ワーク領域 (0xF001 以降, SD_CCS=0xF000の直後)
+; ディスク層ワーク領域 (SD_CCS の直後に連続配置)
 ;==============================================================
 
 CUR_DISK:
@@ -1206,8 +1232,7 @@ DISK_LBA_TMP:
 	DS	4			; ENSURE_BUF内部ワーク(目標LBA)
 
 ;==============================================================
-; DPB共通 (15バイト, 固定アドレス 0xF020)
-; ワーク領域終端 0xF013 の後、パディングを挟んで 0xF020 に配置
+; DPB共通 (15バイト, ワーク領域の直後に連続配置)
 ; SPT=64, BSH=4, BLM=15, EXM=0, DSM=1023, DRM=511,
 ; AL0=0xFF, AL1=0x00, CKS=0, OFF=2
 ;==============================================================
@@ -1225,23 +1250,33 @@ DPB_COMMON:
 	DW	2			; OFF: システム予約トラック数
 
 ;==============================================================
-; DIRBUF共通 (128バイト, 固定アドレス 0xF030)
-; DPB 15B: 0xF020-0xF02E → DIRBUF開始は 0xF030 (1バイトパディング)
+; DIRBUF共通 (128バイト, DPB の直後に連続配置)
 ;==============================================================
 
 DIRBUF:
 	DS	128			; ディレクトリバッファ
 
 ;==============================================================
-; DPHテーブル (8ドライブ×16バイト = 128バイト, 0xF0B0)
-; DIRBUF 128B: 0xF030-0xF0AF → DPHテーブル開始は 0xF0B0
+; ALVバッファ(アロケーションベクタ, 8ドライブ×128B = 1024B)
+;   DSM=1023 → ALVサイズ = (DSM/8)+1 = 128バイト/ドライブ。
+;   各ドライブのALVは独立領域が必須(共有不可)。BDOSが起動時に
+;   ディレクトリを走査してブロック使用状況をこのビットマップに構築する。
+;   ※ これが未確保(ALV=0)だと BDOS が NULL ポインタ(0x0000=ゼロページ)を
+;     破壊する致命バグになる。CKS=0 でも ALV は常に必須(省略可なのは CSV のみ)。
+;==============================================================
+
+ALV_BUF:
+	DS	128*8			; 8ドライブ分のALV(各128B)
+
+;==============================================================
+; DPHテーブル (8ドライブ×16バイト = 128バイト)
 ; 各DPH構成:
-;   XLT   (2B) = 0      (恒等変換のためNULL)
-;   000000(6B)           (予約0)
-;   DIRBUF(2B) = DIRBUF
-;   DPB   (2B) = DPB_COMMON
-;   CSV   (2B) = 0      (CKS=0のためNULL)
-;   ALV   (2B) = 0      (テスト用省略; BDOSはCKS=0時ALVも省略可)
+;   XLT   (2B) = 0          (恒等変換のためNULL)
+;   000000(6B)               (予約0)
+;   DIRBUF(2B) = DIRBUF      (全ドライブ共有)
+;   DPB   (2B) = DPB_COMMON  (全ドライブ共有)
+;   CSV   (2B) = 0           (CKS=0のためNULL; 省略可)
+;   ALV   (2B) = ALV_BUF+d*128 (ドライブ毎に独立; 必須)
 ;==============================================================
 
 DPH_TABLE:
@@ -1250,65 +1285,62 @@ DPH0:	DW	0		; XLT
 	DW	DIRBUF		; DIRBUF
 	DW	DPB_COMMON	; DPB
 	DW	0		; CSV
-	DW	0		; ALV
+	DW	ALV_BUF+0*128	; ALV (ドライブ0)
 
 DPH1:	DW	0
 	DW	0,0,0
 	DW	DIRBUF
 	DW	DPB_COMMON
 	DW	0
-	DW	0
+	DW	ALV_BUF+1*128	; ALV (ドライブ1)
 
 DPH2:	DW	0
 	DW	0,0,0
 	DW	DIRBUF
 	DW	DPB_COMMON
 	DW	0
-	DW	0
+	DW	ALV_BUF+2*128	; ALV (ドライブ2)
 
 DPH3:	DW	0
 	DW	0,0,0
 	DW	DIRBUF
 	DW	DPB_COMMON
 	DW	0
-	DW	0
+	DW	ALV_BUF+3*128	; ALV (ドライブ3)
 
 DPH4:	DW	0
 	DW	0,0,0
 	DW	DIRBUF
 	DW	DPB_COMMON
 	DW	0
-	DW	0
+	DW	ALV_BUF+4*128	; ALV (ドライブ4)
 
 DPH5:	DW	0
 	DW	0,0,0
 	DW	DIRBUF
 	DW	DPB_COMMON
 	DW	0
-	DW	0
+	DW	ALV_BUF+5*128	; ALV (ドライブ5)
 
 DPH6:	DW	0
 	DW	0,0,0
 	DW	DIRBUF
 	DW	DPB_COMMON
 	DW	0
-	DW	0
+	DW	ALV_BUF+6*128	; ALV (ドライブ6)
 
 DPH7:	DW	0
 	DW	0,0,0
 	DW	DIRBUF
 	DW	DPB_COMMON
 	DW	0
-	DW	0
+	DW	ALV_BUF+7*128	; ALV (ドライブ7)
 
 
 ;==============================================================
-; ディスクBIOS実装 (固定アドレス 0xF130)
+; ディスクBIOS実装 (DPHテーブルの直後に連続配置)
 ;   ジャンプテーブルから直接参照される。
-;   SD区域(0xEC00-0xEDFF)/データ領域(0xF000-0xF12F)の
-;   どちらとも重複しない 0xF130 に配置する。
-;   DPHテーブル終端 0xF0B0+128=0xF130 に続けて配置。
-;   VRAMは 0xF300 から。コード領域約 0x1D0=464バイト。
+;   VRAMは 0xF300(固定)から。BIOS全体が origin..0xF2FF に収まること。
 ;==============================================================
 
 ;--------------------------------------------------------------
@@ -1672,24 +1704,24 @@ WRITE_FROM_DMA:
 	RET
 
 ;==============================================================
-; ウォームブート本体・サブルーチン (#36, 0xF2B4以降)
-;   ディスクBIOS(0xF130-0xF2B3)の直後、VRAM(0xF300)の前に配置
+; ウォームブート本体・サブルーチン (#36)
+;   ディスクBIOSの直後、VRAM(0xF300)の前に連続配置
 ;==============================================================
 
 ;--------------------------------------------------------------
 ; WBOOT_BODY: ウォームブート本体
-;   1. SPをBIOS専用スタック(0xF300)に設定(BDOSロード先0xE8FFより上)
+;   1. SPをBIOS専用スタック(BIOS_STACK=VRAM領域)に設定
 ;   2. DI
 ;   3. ダーティバッファフラッシュ
-;   4. SD から CCP/BDOS 再ロード(LBA5-15 → 0xD300-0xE8FF)
+;   4. SD から CCP/BDOS 再ロード(CCP_LBA..(CCP_LBA+10) → CCP_ORG..BDOS末尾)
 ;   5. ゼロページ再設定(0x0000-0x0007 LDIRで書込)
 ;   6. RST7スタブ設置(INSTALL_RST7_STUB呼出)
 ;   7. ワーク初期化(CUR_DISK=0, CUR_DMA=0x0080)
 ;      (CUR_TRACK/CUR_SECTORはBDOSが常にSETTRK/SETSECで設定するため省略)
-;   8. CCP(0xD300)へジャンプ
+;   8. CCP(CCP_ORG)へジャンプ
 ;--------------------------------------------------------------
 WBOOT_BODY:
-	LD	SP, 0F380h		; BIOS専用スタック(VRAM領域、BIOSコード末尾+余裕)
+	LD	SP, BIOS_STACK		; BIOS専用スタック(VRAM領域、BIOSコード末尾+余裕)
 	DI				; 割り込み禁止
 	CALL	FLUSH_DIRTY_BUF		; ダーティバッファフラッシュ
 	CALL	LOAD_CPM_FROM_SD	; CCP/BDOS 再ロード
@@ -1706,21 +1738,22 @@ WBOOT_BODY:
 	LD	(CUR_DISK), A		; カレントドライブ = A(0)
 	LD	HL, 0080h
 	LD	(CUR_DMA), HL		; DMAアドレス = 0x0080(デフォルト)
-	; CCP(0xD300)へジャンプ
-	JP	0D300h
+	; CCP(CCP_ORG)へジャンプ
+	JP	CCP_ORG
 
 ;--------------------------------------------------------------
 ; LOAD_CPM_FROM_SD: CCP/BDOSをSDから一括再ロード
-;   LBA5-15(11ブロック)を0xD300-0xE8FFへ連続ロード。
-;   CCP:  LBA5-8  → 0xD300-0xDAFF
-;   BDOS: LBA9-15 → 0xDB00-0xE8FF
+;   CCP_LBA..(CCP_LBA+10)(11ブロック)を CCP_ORG から連続ロード。
+;   CCP:  CCP_LBA  .. CCP_LBA+3  → CCP_ORG  (4ブロック)
+;   BDOS: BDOS_LBA .. BDOS_LBA+6 → BDOS_ORG (7ブロック)
+;   ※ CCP/BDOSは連続配置(BDOS_ORG = CCP_ORG + 2048)のため一括ロード可能。
 ;   IX=LBAカウンタ(SD_READ_BLOCKで保存)、DE=dstアドレス
 ;   SD_READ_BLOCK破壊: AF,BC,HL (DE・IXは保存される)
 ;   LDIR後のDE(=旧dst+512)をそのまま次ループのdstとして使用。
 ;--------------------------------------------------------------
 LOAD_CPM_FROM_SD:
-	LD	IX, 5			; IX = 開始LBA(5)
-	LD	DE, 0D300h		; DE = ロード先先頭(CCP=0xD300)
+	LD	IX, CCP_LBA		; IX = 開始LBA(CCP_LBA)
+	LD	DE, CCP_ORG		; DE = ロード先先頭(CCP_ORG)
 	LD	B, 11			; B = ブロック数(11=CCP4+BDOS7)
 LCPM_LOOP:
 	PUSH	BC			; ブロック数を保存

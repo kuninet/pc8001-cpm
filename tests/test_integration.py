@@ -10,6 +10,13 @@ import pytest
 
 from emu.pc8001 import PC8001
 from emu.sdcard import SDCard
+from bios_syms import sym
+from memmap import (
+    BIOS_ADDR, CCP_ADDR, BDOS_ADDR, BIOS_END, ZP_JP_WBOOT, ZP_JP_BDOS, BIOS_BLOCKS,
+)
+
+# make / sd_tool に渡す環境・引数(memmap と同じ BIOS_BLOCKS で一貫させる)
+_BB_ENV = {**os.environ, "BIOS_BLOCKS": str(BIOS_BLOCKS)}
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(PROJECT_ROOT, "build")
@@ -26,7 +33,8 @@ def _build_all() -> None:
     if not os.path.isdir(EXTERNAL_CPM22):
         pytest.skip("external/cpm22 が未取得")
     for t in ("bios", "cpm", "loader"):
-        r = subprocess.run(["make", t], cwd=PROJECT_ROOT, capture_output=True, text=True)
+        r = subprocess.run(["make", t], cwd=PROJECT_ROOT, capture_output=True,
+                           text=True, env=_BB_ENV)
         if r.returncode != 0:
             pytest.fail(f"make {t} 失敗: {r.stderr or r.stdout}")
 
@@ -48,7 +56,8 @@ def build_once():
 def _make_bootable_image(tmp_path) -> str:
     img = str(tmp_path / "boot.img")
     _run_sd_tool("mkimage", "--out", img)
-    _run_sd_tool("sys", "--image", img, "--bios", BIOS_BIN, "--ccp", CCP_BIN, "--bdos", BDOS_BIN)
+    _run_sd_tool("sys", "--image", img, "--bios", BIOS_BIN, "--ccp", CCP_BIN,
+                 "--bdos", BDOS_BIN, "--bios-blocks", str(BIOS_BLOCKS))
     hello = tmp_path / "HELLO.COM"
     hello.write_bytes(b"\x3E\x41\x76")  # LD A,'A'; HALT
     _run_sd_tool("put", "--image", img, "--drive", "A", "--file", str(hello))
@@ -69,12 +78,18 @@ def _boot(image_path: str):
     return pc, sd
 
 
+def _boot_jp_bytes():
+    """BIOS 先頭の JP BOOT = [0xC3, lo, hi]。"""
+    boot = sym("BOOT")
+    return [0xC3, boot & 0xFF, (boot >> 8) & 0xFF]
+
+
 def _run(pc, max_steps: int = 6_000_000) -> str:
     for _ in range(max_steps):
         if pc.cpu.halted:
             return "halt"
         pcv = pc.cpu.pc
-        if 0xD300 <= pcv < 0xDB00:
+        if CCP_ADDR <= pcv < BDOS_ADDR:
             return "ccp"
         if pc._mem_read(pcv) == 0x76:
             return "halt"
@@ -86,6 +101,7 @@ def _run(pc, max_steps: int = 6_000_000) -> str:
 class TestEndToEnd:
     def test_bootable_image_size(self, tmp_path):
         img = _make_bootable_image(tmp_path)
+        # 8ドライブ × 4128ブロック × 512B = 33024ブロック
         assert os.path.getsize(img) == 33024 * 512
 
     def test_loader_boots_to_bios(self, tmp_path):
@@ -93,44 +109,39 @@ class TestEndToEnd:
         pc, _ = _boot(img)
         result = _run(pc)
         assert result in ("halt", "ccp"), f"BIOS到達せず: {result} pc=0x{pc.cpu.pc:04X}"
-        assert (0xE900 <= pc.cpu.pc <= 0xF2FF) or (0xD300 <= pc.cpu.pc <= 0xDAFF)
+        assert (BIOS_ADDR <= pc.cpu.pc <= BIOS_END) or (CCP_ADDR <= pc.cpu.pc < BDOS_ADDR)
 
-    def test_bios_at_e900(self, tmp_path):
+    def test_bios_loaded(self, tmp_path):
         img = _make_bootable_image(tmp_path)
         pc, _ = _boot(img)
         _run(pc)
-        assert pc._mem_read(0xE900) == 0xC3
-        assert pc._mem_read(0xE901) == 0x33
-        assert pc._mem_read(0xE902) == 0xE9
+        actual = [pc._mem_read(BIOS_ADDR + i) for i in range(3)]
+        assert actual == _boot_jp_bytes()
 
-    def test_ccp_at_d300(self, tmp_path):
+    def test_ccp_loaded(self, tmp_path):
         img = _make_bootable_image(tmp_path)
         pc, _ = _boot(img)
         _run(pc)
         with open(CCP_BIN, "rb") as f:
             ccp = f.read()
-        actual = bytes(pc._mem_read(0xD300 + i) for i in range(4))
+        actual = bytes(pc._mem_read(CCP_ADDR + i) for i in range(4))
         assert actual == ccp[:4]
 
-    def test_bdos_at_db00(self, tmp_path):
+    def test_bdos_loaded(self, tmp_path):
         img = _make_bootable_image(tmp_path)
         pc, _ = _boot(img)
         _run(pc)
         with open(BDOS_BIN, "rb") as f:
             bdos = f.read()
-        actual = bytes(pc._mem_read(0xDB00 + i) for i in range(8))
+        actual = bytes(pc._mem_read(BDOS_ADDR + i) for i in range(8))
         assert actual == bdos[:8]
 
     def test_zero_page_jumps(self, tmp_path):
         img = _make_bootable_image(tmp_path)
         pc, _ = _boot(img)
         _run(pc)
-        assert pc._mem_read(0x0000) == 0xC3
-        assert pc._mem_read(0x0001) == 0x03
-        assert pc._mem_read(0x0002) == 0xE9
-        assert pc._mem_read(0x0005) == 0xC3
-        assert pc._mem_read(0x0006) == 0x06
-        assert pc._mem_read(0x0007) == 0xDB
+        assert [pc._mem_read(0x0000 + i) for i in range(3)] == ZP_JP_WBOOT
+        assert [pc._mem_read(0x0005 + i) for i in range(3)] == ZP_JP_BDOS
 
     def test_e2_after_boot(self, tmp_path):
         img = _make_bootable_image(tmp_path)

@@ -15,11 +15,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from emu.pc8001 import PC8001, VRAM_BASE, VRAM_ROW_BYTES
 from bios_syms import sym
+import memmap
 
 # ---------------------------------------------------------------
-# BIOS 定数
+# BIOS 定数(配置は tests/memmap.py で BIOS_BLOCKS から導出)
 # ---------------------------------------------------------------
-BIOS_ORG  = 0xE900
+BIOS_ORG  = memmap.BIOS_ADDR
+CCP_ADDR  = memmap.CCP_ADDR
 BIOS_BIN  = os.path.join(PROJECT_ROOT, "build", "bios.bin")
 BIOS_SRC  = os.path.join(PROJECT_ROOT, "src", "bios", "bios.asm")
 BUILD_DIR = os.path.join(PROJECT_ROOT, "build")
@@ -29,8 +31,7 @@ CONST_VEC  = BIOS_ORG + 2 * 3   # vec(2) = CONST
 CONIN_VEC  = BIOS_ORG + 3 * 3   # vec(3) = CONIN
 
 
-def vec(n: int) -> int:
-    return BIOS_ORG + 3 * n
+vec = memmap.vec
 
 
 # ---------------------------------------------------------------
@@ -41,7 +42,7 @@ def _build_bios() -> None:
     os.makedirs(BUILD_DIR, exist_ok=True)
     p_file = os.path.join(BUILD_DIR, "bios.p")
     result = subprocess.run(
-        ["asl", "-D", "origin=0E900h", "-o", p_file, BIOS_SRC],
+        ["asl", *memmap.bios_asl_defines(), "-o", p_file, BIOS_SRC],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -130,8 +131,8 @@ class TestBoot:
         """BOOT後: VRAM の全行が空白(0x20)またはサインオン文字。"""
         instance = PC8001()
         _load_bios(instance)
-        # BOOT は最後に JP 0xD300(CCP) へジャンプするので、0xD300 に HALT を置く
-        instance.load(0xD300, bytes([0x76]))
+        # BOOT は最後に JP CCP_ORG(CCP) へジャンプするので、CCP_ORG に HALT を置く
+        instance.load(CCP_ADDR, bytes([0x76]))
         instance.set_pc(BIOS_ORG)
         instance.run_until_halt(max_steps=500000)
 
@@ -146,8 +147,8 @@ class TestBoot:
         """BOOT後: 全行のアトリビュート40バイトが 0x00。"""
         instance = PC8001()
         _load_bios(instance)
-        # BOOT は最後に JP 0xD300(CCP) へジャンプするので、0xD300 に HALT を置く
-        instance.load(0xD300, bytes([0x76]))
+        # BOOT は最後に JP CCP_ORG(CCP) へジャンプするので、CCP_ORG に HALT を置く
+        instance.load(CCP_ADDR, bytes([0x76]))
         instance.set_pc(BIOS_ORG)
         instance.run_until_halt(max_steps=500000)
 

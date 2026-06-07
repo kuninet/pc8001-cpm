@@ -15,18 +15,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from emu.pc8001 import PC8001
 from emu.sdcard import SDCard
 from bios_syms import sym
+import memmap
 
 # ---------------------------------------------------------------
-# 定数
+# 定数(配置は tests/memmap.py で BIOS_BLOCKS から導出)
 # ---------------------------------------------------------------
-BIOS_ORG  = 0xE900
+BIOS_ORG  = memmap.BIOS_ADDR
 BIOS_BIN  = os.path.join(PROJECT_ROOT, "build", "bios.bin")
 BIOS_SRC  = os.path.join(PROJECT_ROOT, "src", "bios", "bios.asm")
 BUILD_DIR = os.path.join(PROJECT_ROOT, "build")
 
-# BIOS ジャンプテーブル: vec(n) = 0xE900 + 3*n
-def vec(n: int) -> int:
-    return BIOS_ORG + 3 * n
+# BIOS ジャンプテーブル: vec(n) = BIOS_ORG + 3*n
+vec = memmap.vec
 
 # ---------------------------------------------------------------
 # LBA 計算ヘルパ (BIOS の CALC_LBA と同じ計算)
@@ -56,14 +56,14 @@ def _build_bios() -> None:
     bin_file = BIOS_BIN
 
     result = subprocess.run(
-        ["asl", "-D", "origin=0E900h", "-o", p_file, BIOS_SRC],
+        ["asl", *memmap.bios_asl_defines(), "-o", p_file, BIOS_SRC],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
         pytest.fail(f"asl アセンブル失敗\n{result.stdout}\n{result.stderr}")
 
     result = subprocess.run(
-        ["p2bin", p_file, bin_file, "-r", "$e900-$f2ff"],
+        ["p2bin", p_file, bin_file, "-r", memmap.bios_p2bin_range()],
         capture_output=True, text=True,
     )
     if result.returncode != 0:

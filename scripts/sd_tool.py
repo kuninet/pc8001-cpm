@@ -14,6 +14,7 @@
   - ドライブ d(0-7)の先頭LBA = d × 4128
   - 各ドライブ内: OFF(32ブロック=16KB)=システム領域、残り4096ブロック=データ領域
   - データ領域内: 先頭8ブロック(BLS=2KB×8=16KB)=ディレクトリ、続いてファイル領域
+  - システム領域(ドライブA先頭): BIOS(LBA 0..N-1) / CCP(LBA N..N+3) / BDOS(LBA N+4..N+10)。N=BIOS_BLOCKS(既定9)。配置アドレスは BIOS_BLOCKS から導出(doc/設計/01_メモリマップ.md, tests/memmap.py)
 
 DPB(Disk Parameter Block):
   SPT=64, BSH=4(BLS=2KB), BLM=15, EXM=0
@@ -76,13 +77,19 @@ EXTENT_SIZE = EXTENT_BLOCKS * CPM_BLOCK_SIZE   # 16384B = 16KB
 # 1エクステント内の128Bレコード数
 EXTENT_RECORDS = EXTENT_SIZE // 128   # 128
 
-# システム領域(build_cpm_image.py 準拠)
-SYS_LAYOUT = [
-    ("BIOS", 0, 5),   # LBA 0-4 (5 SDブロック = 2560B)
-    ("CCP",  5, 4),   # LBA 5-8 (4 SDブロック = 2048B)
-    ("BDOS", 9, 7),   # LBA 9-15 (7 SDブロック = 3584B)
-]
-SYS_TOTAL_BLOCKS = 16  # LBA 0-15 = 16 SDブロック = 8192B
+# システム領域(build_cpm_image.py 準拠、単一パラメータ BIOS_BLOCKS から導出)
+SYS_CCP_BLOCKS = 4       # CCP 2048B 固定
+SYS_BDOS_BLOCKS = 7      # BDOS 3584B 固定
+DEFAULT_BIOS_BLOCKS = 9  # Makefile の BIOS_BLOCKS デフォルトと一致させること
+
+
+def make_sys_layout(bios_blocks: int):
+    """BIOS_BLOCKS から (name, start_lba, blocks) のシステム領域レイアウトを導出。"""
+    return [
+        ("BIOS", 0, bios_blocks),
+        ("CCP", bios_blocks, SYS_CCP_BLOCKS),
+        ("BDOS", bios_blocks + SYS_CCP_BLOCKS, SYS_BDOS_BLOCKS),
+    ]
 
 # ドライブ数
 NUM_DRIVES = 8
@@ -364,14 +371,22 @@ def cmd_mkimage(out_path: str) -> None:
     print(f"  作成: {out_path} ({len(image)}B = {total_bytes // SD_BLOCK}ブロック)")
 
 
-def cmd_sys(image_path: str, bios_path: str, ccp_path: str, bdos_path: str) -> None:
-    """ドライブAのOFF領域(LBA 0-15)にBIOS/CCP/BDOSを書き込む。
+def cmd_sys(image_path: str, bios_path: str, ccp_path: str, bdos_path: str,
+            bios_blocks: int = DEFAULT_BIOS_BLOCKS) -> None:
+    """ドライブAのOFF領域にBIOS/CCP/BDOSを書き込む。
 
-    build_cpm_image.py と同一レイアウト:
-      LBA 0-4  : BIOS (5ブロック = 2560B) → 0xE900にロード
-      LBA 5-8  : CCP  (4ブロック = 2048B) → 0xD300にロード
-      LBA 9-15 : BDOS (7ブロック = 3584B) → 0xDB00にロード
+    レイアウトは BIOS_BLOCKS(N)から導出(build_cpm_image.py と同一):
+      LBA 0..(N-1)      : BIOS (N ブロック)
+      LBA N..(N+3)      : CCP  (4ブロック = 2048B)
+      LBA (N+4)..(N+10) : BDOS (7ブロック = 3584B)
     """
+    sys_layout = make_sys_layout(bios_blocks)
+    sys_total = bios_blocks + SYS_CCP_BLOCKS + SYS_BDOS_BLOCKS
+    if sys_total > OFF_SECTORS:
+        print(f"ERROR: システム領域 {sys_total}ブロックが OFF領域 {OFF_SECTORS}ブロックを超過"
+              f"(BIOS_BLOCKS={bios_blocks} が大きすぎる)", file=sys.stderr)
+        sys.exit(1)
+
     def _load(path: str, max_bytes: int, name: str) -> bytes:
         with open(path, 'rb') as f:
             data = f.read()
@@ -386,7 +401,7 @@ def cmd_sys(image_path: str, bios_path: str, ccp_path: str, bdos_path: str) -> N
 
     # ドライブAの先頭 = バイトオフセット 0
     base = drive_base_offset(0)
-    for name, start_lba, blocks in SYS_LAYOUT:
+    for name, start_lba, blocks in sys_layout:
         max_bytes = blocks * SD_BLOCK
         data = _load(inputs[name], max_bytes, name)
         off = base + start_lba * SD_BLOCK
@@ -692,6 +707,8 @@ def main() -> int:
     p_sys.add_argument('--bios', required=True, metavar='FILE', help='BIOS バイナリ')
     p_sys.add_argument('--ccp', required=True, metavar='FILE', help='CCP バイナリ')
     p_sys.add_argument('--bdos', required=True, metavar='FILE', help='BDOS バイナリ')
+    p_sys.add_argument('--bios-blocks', type=int, default=DEFAULT_BIOS_BLOCKS,
+                       metavar='N', help='BIOSが占めるSDブロック数(Makefile の BIOS_BLOCKS と一致)')
 
     # put
     p_put = sub.add_parser('put', help='ファイルをCP/Mドライブに書き込み')
@@ -723,7 +740,7 @@ def main() -> int:
     if args.command == 'mkimage':
         cmd_mkimage(args.out)
     elif args.command == 'sys':
-        cmd_sys(args.image, args.bios, args.ccp, args.bdos)
+        cmd_sys(args.image, args.bios, args.ccp, args.bdos, args.bios_blocks)
     elif args.command == 'put':
         cmd_put(args.image, args.drive, args.file, args.name, args.user)
     elif args.command == 'dir':

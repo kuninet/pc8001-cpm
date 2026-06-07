@@ -17,11 +17,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from emu.pc8001 import PC8001
 from emu.sdcard import SDCard
 from bios_syms import sym
+import memmap
 
 # ---------------------------------------------------------------
-# 定数
+# 定数(配置は tests/memmap.py で BIOS_BLOCKS から導出)
 # ---------------------------------------------------------------
-BIOS_ORG  = 0xE900
+BIOS_ORG  = memmap.BIOS_ADDR
 BIOS_BIN  = os.path.join(PROJECT_ROOT, "build", "bios.bin")
 BIOS_LST  = os.path.join(PROJECT_ROOT, "build", "bios.lst")
 BIOS_SRC  = os.path.join(PROJECT_ROOT, "src", "bios", "bios.asm")
@@ -40,7 +41,7 @@ def _build_bios() -> None:
     lst_file = BIOS_LST
 
     result = subprocess.run(
-        ["asl", "-D", "origin=0E900h",
+        ["asl", *memmap.bios_asl_defines(),
          "-L", "-olist", lst_file,
          "-o", p_file, BIOS_SRC],
         capture_output=True, text=True,

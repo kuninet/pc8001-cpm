@@ -1,13 +1,13 @@
 """CP/Mシステムイメージ統合テスト(#37)。
 
-`make cpm-image` で生成した SDシステムイメージ(8192B)を SDモデルに載せ、
+`make cpm-image` で生成した SDシステムイメージを SDモデルに載せ、
 ローダ(0x6000)を起動 → BIOS/CCP/BDOS が正しい配置にロードされ、
-CCP 実体(0xD300) へ制御が渡ることを検証する。
+CCP 実体へ制御が渡ることを検証する。
 
-ローダ仕様(#35):
-  LBA 0-4  → 0xE900 (BIOS)
-  LBA 5-8  → 0xD300 (CCP)
-  LBA 9-15 → 0xDB00 (BDOS)
+配置・LBA は単一パラメータ BIOS_BLOCKS から導出(tests/memmap.py)。
+  LBA 0..(N-1)     → BIOS_ADDR
+  LBA N..(N+3)     → CCP_ADDR
+  LBA (N+4)..(N+10)→ BDOS_ADDR     (N=BIOS_BLOCKS)
 """
 import os
 import subprocess
@@ -16,12 +16,27 @@ import pytest
 
 from emu.pc8001 import PC8001
 from emu.sdcard import SDCard
+from bios_syms import sym
+from memmap import (
+    BIOS_ADDR, CCP_ADDR, BDOS_ADDR, BDOS_ENTRY,
+    CCP_LBA_START, BDOS_LBA_START,
+    BIOS_BLOCKS, CCP_BLOCKS, BDOS_BLOCKS, BLOCK_SIZE,
+    ZP_JP_WBOOT, ZP_JP_BDOS,
+)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(PROJECT_ROOT, "build")
 LOADER_BIN = os.path.join(BUILD, "loader.bin")
 CPM_IMAGE = os.path.join(BUILD, "cpm-image.bin")
 EXTERNAL_CPM22 = os.path.join(PROJECT_ROOT, "external", "cpm22")
+
+TOTAL_BLOCKS = BIOS_BLOCKS + CCP_BLOCKS + BDOS_BLOCKS
+
+
+def _boot_jp_bytes():
+    """BIOS 先頭の JP BOOT = [0xC3, lo, hi]。"""
+    boot = sym("BOOT")
+    return bytes([0xC3, boot & 0xFF, (boot >> 8) & 0xFF])
 
 
 def _build_all() -> None:
@@ -61,9 +76,9 @@ def _run_until_ccp(pc, max_steps=5_000_000):
         if pc.cpu.halted:
             return "halt"
         pc_val = pc.cpu.pc
-        if 0xD300 <= pc_val < 0xDB00:
+        if CCP_ADDR <= pc_val < BDOS_ADDR:
             return "ccp"
-        if 0xDB00 <= pc_val < 0xE900:
+        if BDOS_ADDR <= pc_val < BIOS_ADDR:
             return "bdos"
         if pc._mem_read(pc_val) == 0x76:
             return "halt"
@@ -74,26 +89,26 @@ def _run_until_ccp(pc, max_steps=5_000_000):
 
 class TestCpmImage:
     def test_image_size(self):
-        assert os.path.getsize(CPM_IMAGE) == 8192
+        assert os.path.getsize(CPM_IMAGE) == TOTAL_BLOCKS * BLOCK_SIZE
 
     def test_bios_first_bytes(self):
         with open(CPM_IMAGE, "rb") as f:
             img = f.read()
-        # BIOS 先頭 = JP BOOT (0xC3, 0x33, 0xE9)
-        assert img[0:3] == bytes([0xC3, 0x33, 0xE9])
+        # BIOS 先頭 = JP BOOT
+        assert img[0:3] == _boot_jp_bytes()
 
     def test_bdos_entry(self):
         with open(CPM_IMAGE, "rb") as f:
             img = f.read()
-        # LBA9 + 6 = BDOSエントリ JP nn(0xDB?? へ)
-        off = 9 * 512 + 6
+        # BDOS先頭LBA + 6 = BDOSエントリ JP nn(BDOS領域内へ)
+        off = BDOS_LBA_START * BLOCK_SIZE + 6
         assert img[off] == 0xC3
-        assert img[off + 2] == 0xDB
+        assert img[off + 2] == (BDOS_ADDR >> 8) & 0xFF
 
     def test_loader_reaches_bios(self):
-        """ローダ → BIOS BOOT → CCP(0xD300)起動チェーン到達。
+        """ローダ → BIOS BOOT → CCP起動チェーン到達。
 
-        BOOT_DONE は CCP(0x0D300)へジャンプする。ローダが BIOS BOOT を
+        BOOT_DONE は CCP(CCP_ADDR)へジャンプする。ローダが BIOS BOOT を
         正しく起動し、CCP→BDOS の起動チェーンに制御が渡ることを確認する。
         (_run_until_ccp は200tickバッチ実行のスナップショット判定のため、
          CCP領域を踏み越えてBDOS領域で検出されることがある)
@@ -104,25 +119,25 @@ class TestCpmImage:
         assert result in ("ccp", "bdos"), (
             f"CCP起動チェーン未到達: {result} pc=0x{pc.cpu.pc:04X}"
         )
-        # PC が CCP/BDOS 領域(0xD300-0xE8FF)に居る
-        assert 0xD300 <= pc.cpu.pc < 0xE900, (
+        # PC が CCP/BDOS 領域(CCP_ADDR..BIOS_ADDR-1)に居る
+        assert CCP_ADDR <= pc.cpu.pc < BIOS_ADDR, (
             f"想定外のPC: 0x{pc.cpu.pc:04X}"
         )
 
     def test_bios_loaded(self):
         pc, _ = _make_pc_with_image()
         _run_until_ccp(pc)
-        assert pc._mem_read(0xE900) == 0xC3
-        assert pc._mem_read(0xE901) == 0x33
-        assert pc._mem_read(0xE902) == 0xE9
+        actual = bytes(pc._mem_read(BIOS_ADDR + i) for i in range(3))
+        assert actual == _boot_jp_bytes()
 
     def test_ccp_loaded(self):
         pc, _ = _make_pc_with_image()
         _run_until_ccp(pc)
         with open(CPM_IMAGE, "rb") as f:
             img = f.read()
-        expected = img[5 * 512 : 5 * 512 + 4]
-        actual = bytes(pc._mem_read(0xD300 + i) for i in range(4))
+        off = CCP_LBA_START * BLOCK_SIZE
+        expected = img[off : off + 4]
+        actual = bytes(pc._mem_read(CCP_ADDR + i) for i in range(4))
         assert actual == expected
 
     def test_bdos_loaded(self):
@@ -130,18 +145,15 @@ class TestCpmImage:
         _run_until_ccp(pc)
         with open(CPM_IMAGE, "rb") as f:
             img = f.read()
-        expected = img[9 * 512 + 6 : 9 * 512 + 10]
-        actual = bytes(pc._mem_read(0xDB06 + i) for i in range(4))
+        off = BDOS_LBA_START * BLOCK_SIZE + 6
+        expected = img[off : off + 4]
+        actual = bytes(pc._mem_read(BDOS_ENTRY + i) for i in range(4))
         assert actual == expected
 
     def test_zero_page_jumps(self):
         pc, _ = _make_pc_with_image()
         _run_until_ccp(pc)
-        # 0x0000: JP 0E903h (WBOOT)
-        assert pc._mem_read(0x0000) == 0xC3
-        assert pc._mem_read(0x0001) == 0x03
-        assert pc._mem_read(0x0002) == 0xE9
-        # 0x0005: JP 0DB06h (BDOS)
-        assert pc._mem_read(0x0005) == 0xC3
-        assert pc._mem_read(0x0006) == 0x06
-        assert pc._mem_read(0x0007) == 0xDB
+        # 0x0000: JP WBOOT
+        assert [pc._mem_read(0x0000 + i) for i in range(3)] == ZP_JP_WBOOT
+        # 0x0005: JP BDOS
+        assert [pc._mem_read(0x0005 + i) for i in range(3)] == ZP_JP_BDOS
