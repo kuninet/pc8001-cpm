@@ -14,5 +14,14 @@ Thumbs.db
 *.o
 *.rel
 *.tmp
+*.p
 build/
 tmp/
+
+# Python 仮想環境
+.venv/
+__pycache__/
+*.pyc
+
+# 外部取得物(エミュレータコア/CP/M本体ソース等・コミット対象外)
+external/
