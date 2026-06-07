@@ -365,6 +365,8 @@ class TestBoot:
         """pc=0xE900 で run_until_halt → 1行目が 'PC-8001 CP/M 2.2 BIOS' で始まる。"""
         pc = PC8001()
         _load_bios(pc)
+        # BOOT は最後に JP 0xD300(CCP) へジャンプするので、0xD300 に HALT を置く
+        pc.load(0xD300, bytes([0x76]))
         # BOOT はスタックを DF00h に設定するので SP 設定は不要
         pc.set_pc(BIOS_ORG)
         result = pc.run_until_halt(max_steps=200000)

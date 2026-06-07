@@ -77,8 +77,9 @@ $(BUILD)/bdos.bin: $(CPM_SRC)/bdos.asm | $(BUILD)
 # --- BIOS ---
 BIOS_ORG ?= 0E900h
 
+# -L -OLIST でシンボル表付きリスティングを出力(テストがシンボルでアドレス取得)
 $(BUILD)/bios.p: src/bios/bios.asm | $(BUILD)
-	$(AS) -D origin=$(BIOS_ORG) -o $(BUILD)/bios.p src/bios/bios.asm
+	$(AS) -D origin=$(BIOS_ORG) -L -OLIST $(BUILD)/bios.lst -o $(BUILD)/bios.p src/bios/bios.asm
 
 $(BUILD)/bios.bin: $(BUILD)/bios.p
 	$(P2BIN) $(BUILD)/bios.p $(BUILD)/bios.bin -r '$$e900-$$f2ff'

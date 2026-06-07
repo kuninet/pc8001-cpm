@@ -91,20 +91,21 @@ class TestCpmImage:
         assert img[off + 2] == 0xDB
 
     def test_loader_reaches_bios(self):
-        """ローダ → BIOS(0xE900領域) または BIOSのHALT到達。
+        """ローダ → BIOS BOOT → CCP(0xD300)起動チェーン到達。
 
-        現状のBIOS雛形 BOOT_DONE は HALT(設計どおり、CCPダミー本体待ち)。
-        ローダが BIOS BOOT を正しく起動できることを「BIOS領域到達」または
-        「サインオン後HALT」で確認する。CCPダミーへの実ジャンプは別途WBOOT経由テストで検証。
+        BOOT_DONE は CCP(0x0D300)へジャンプする。ローダが BIOS BOOT を
+        正しく起動し、CCP→BDOS の起動チェーンに制御が渡ることを確認する。
+        (_run_until_ccp は200tickバッチ実行のスナップショット判定のため、
+         CCP領域を踏み越えてBDOS領域で検出されることがある)
         """
         pc, _ = _make_pc_with_image()
         result = _run_until_ccp(pc)
-        # BIOSのHALT(BOOT_DONE)到達、または BIOS領域内で動作中(timeoutなし)
-        assert result in ("halt", "ccp"), (
-            f"BIOS到達せず: {result} pc=0x{pc.cpu.pc:04X}"
+        # CCP もしくは BDOS 領域へ制御が渡っている(起動チェーン成立)
+        assert result in ("ccp", "bdos"), (
+            f"CCP起動チェーン未到達: {result} pc=0x{pc.cpu.pc:04X}"
         )
-        # PC が BIOS 領域(0xE900-0xF2FF)に居る、または CCPアドレスに居る
-        assert (0xE900 <= pc.cpu.pc <= 0xF2FF) or (0xD300 <= pc.cpu.pc <= 0xDAFF), (
+        # PC が CCP/BDOS 領域(0xD300-0xE8FF)に居る
+        assert 0xD300 <= pc.cpu.pc < 0xE900, (
             f"想定外のPC: 0x{pc.cpu.pc:04X}"
         )
 
