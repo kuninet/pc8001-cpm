@@ -19,9 +19,11 @@ import pytest
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from emu.pc8001 import PC8001
 from emu.sdcard import SDCard
+from bios_syms import sym
 
 # ---------------------------------------------------------------
 # 定数
@@ -37,7 +39,6 @@ def vec(n: int) -> int:
 
 # ベクタアドレス
 WBOOT_ADDR      = 0xE945    # WBOOT エントリ固定アドレス
-SD_INIT_VEC     = 0xEC00    # SD_INIT 固定アドレス
 
 # CP/M メモリマップ
 CCP_ADDR        = 0xD300    # CCP ロード先
@@ -51,11 +52,6 @@ BLOCK_SIZE      = 512       # SD ブロックサイズ
 # ゼロページ期待値
 ZP_JP_WBOOT     = [0xC3, 0x03, 0xE9]   # JP 0xE903 (WBOOT)
 ZP_JP_BDOS      = [0xC3, 0x06, 0xDB]   # JP 0xDB06 (BDOS)
-
-# ディスク層ワーク変数
-CUR_DISK_ADDR   = 0xF001
-CUR_DMA_ADDR    = 0xF006
-BUF_DIRTY_ADDR  = 0xF00C
 
 
 # ---------------------------------------------------------------
@@ -145,7 +141,7 @@ def setup_wboot_env() -> tuple[PC8001, SDCard]:
     # BIOS をロード
     _load_bios(pc)
     # SD_INIT を事前実行 (CCS を確定させる)
-    _call_addr(pc, SD_INIT_VEC)
+    _call_addr(pc, sym('SD_INIT'))
     return pc, sd
 
 
@@ -345,7 +341,9 @@ class TestRst7Stub:
         _load_bios(pc)
         # e2=0x11 で拡張RAM書込を有効化
         pc.e2 = 0x11
-        # BOOT (0xE900) を実行 → HALT で停止
+        # BOOT は最後に JP 0xD300(CCP) へジャンプするので、0xD300 に HALT を置く
+        pc.load(CCP_ADDR, bytes([0x76]))
+        # BOOT (0xE900) を実行 → CCP の HALT で停止
         pc.set_pc(BIOS_ORG)
         halted = pc.run_until_halt(max_steps=200000)
         assert halted, "BOOT: HALT に到達しなかった"
@@ -369,13 +367,13 @@ class TestWbootWorkInit:
         """
         pc, sd = setup_wboot_env()
         # まず別ドライブを選択しておく
-        pc._mem_write(CUR_DISK_ADDR, 3)
+        pc._mem_write(sym('CUR_DISK'), 3)
         pc.cpu.sp = 0xDF00
         pc.cpu.halted = False
         pc.set_pc(WBOOT_ADDR)
         pc.run_until_halt(max_steps=5000000)
 
-        val = pc._mem_read(CUR_DISK_ADDR)
+        val = pc._mem_read(sym('CUR_DISK'))
         assert val == 0, f"CUR_DISK={val} (expected 0=drive A)"
 
     def test_cur_dma_is_0x0080(self):
@@ -384,15 +382,16 @@ class TestWbootWorkInit:
         """
         pc, sd = setup_wboot_env()
         # まず別アドレスに設定しておく
-        pc._mem_write(CUR_DMA_ADDR, 0x00)
-        pc._mem_write(CUR_DMA_ADDR + 1, 0x90)
+        cur_dma = sym('CUR_DMA')
+        pc._mem_write(cur_dma, 0x00)
+        pc._mem_write(cur_dma + 1, 0x90)
         pc.cpu.sp = 0xDF00
         pc.cpu.halted = False
         pc.set_pc(WBOOT_ADDR)
         pc.run_until_halt(max_steps=5000000)
 
-        lo = pc._mem_read(CUR_DMA_ADDR)
-        hi = pc._mem_read(CUR_DMA_ADDR + 1)
+        lo = pc._mem_read(cur_dma)
+        hi = pc._mem_read(cur_dma + 1)
         dma = lo | (hi << 8)
         assert dma == 0x0080, f"CUR_DMA=0x{dma:04X} (expected 0x0080)"
 
@@ -439,12 +438,13 @@ class TestWbootDirtyFlush:
 
         # BUF_DIRTY を 1 に設定 (ダーティ状態にする)
         # BUF_LBA も有効な値に設定しておく (0 = LBA0)
-        BUF_LBA_ADDR = 0xF008
-        pc._mem_write(0xF00C, 1)       # BUF_DIRTY = 1
-        pc._mem_write(BUF_LBA_ADDR, 0) # BUF_LBA = 0
-        pc._mem_write(BUF_LBA_ADDR+1, 0)
-        pc._mem_write(BUF_LBA_ADDR+2, 0)
-        pc._mem_write(BUF_LBA_ADDR+3, 0)
+        buf_lba = sym('BUF_LBA')
+        buf_dirty = sym('BUF_DIRTY')
+        pc._mem_write(buf_dirty, 1)    # BUF_DIRTY = 1
+        pc._mem_write(buf_lba, 0)      # BUF_LBA = 0
+        pc._mem_write(buf_lba+1, 0)
+        pc._mem_write(buf_lba+2, 0)
+        pc._mem_write(buf_lba+3, 0)
 
         pc.cpu.sp = 0xDF00
         pc.cpu.halted = False
@@ -452,5 +452,5 @@ class TestWbootDirtyFlush:
         pc.run_until_halt(max_steps=5000000)
 
         # WBOOT 後は BUF_DIRTY = 0 になっているはず
-        dirty = pc._mem_read(BUF_DIRTY_ADDR)
+        dirty = pc._mem_read(buf_dirty)
         assert dirty == 0, f"BUF_DIRTY={dirty} (expected 0 after WBOOT flush)"

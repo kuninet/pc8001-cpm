@@ -12,9 +12,11 @@ import pytest
 # プロジェクトルートをパスに追加
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from emu.pc8001 import PC8001
 from emu.sdcard import SDCard
+from bios_syms import sym
 
 # ---------------------------------------------------------------
 # 定数
@@ -24,12 +26,6 @@ BIOS_BIN  = os.path.join(PROJECT_ROOT, "build", "bios.bin")
 BIOS_LST  = os.path.join(PROJECT_ROOT, "build", "bios.lst")
 BIOS_SRC  = os.path.join(PROJECT_ROOT, "src", "bios", "bios.asm")
 BUILD_DIR = os.path.join(PROJECT_ROOT, "build")
-
-# 固定アドレス (bios.asm の org 0EC00h / org 0EE00h で確定)
-SD_INIT_VEC  = 0xEC00
-SD_READ_VEC  = 0xEC03
-SD_WRITE_VEC = 0xEC06
-SD_BUF_ADDR  = 0xEE00
 
 # ---------------------------------------------------------------
 # ビルドヘルパ
@@ -118,7 +114,7 @@ def _call_addr(pc: PC8001, addr: int, max_steps: int = 2000000) -> bool:
 # ---------------------------------------------------------------
 
 class TestSDInit:
-    """SD_INIT (0xEC00) の動作テスト"""
+    """SD_INIT の動作テスト"""
 
     def test_sd_init_success_with_sdhc(self):
         """
@@ -127,7 +123,7 @@ class TestSDInit:
         """
         pc, sd = setup_sd()
 
-        halted = _call_addr(pc, SD_INIT_VEC)
+        halted = _call_addr(pc, sym('SD_INIT'))
         assert halted, "SD_INIT: HALT に到達しなかった"
 
         # A=0 (成功) かつ CY=0 を確認
@@ -146,12 +142,10 @@ class TestSDInit:
         """
         pc, sd = setup_sd()
 
-        halted = _call_addr(pc, SD_INIT_VEC)
+        halted = _call_addr(pc, sym('SD_INIT'))
         assert halted, "SD_INIT: HALT に到達しなかった"
 
-        # SD_CCS = SD_BUF_ADDR + 512
-        sd_ccs_addr = SD_BUF_ADDR + 512
-        ccs = pc._mem_read(sd_ccs_addr)
+        ccs = pc._mem_read(sym('SD_CCS'))
         assert ccs != 0, f"SD_CCS={ccs:#04x} (expected non-zero for SDHC)"
 
     def test_sd_init_no_sd_fails(self):
@@ -162,7 +156,7 @@ class TestSDInit:
         pc = PC8001()  # SDなし
         _load_bios(pc)
 
-        halted = _call_addr(pc, SD_INIT_VEC)
+        halted = _call_addr(pc, sym('SD_INIT'))
         assert halted, "SD_INIT(SD無し): HALT に到達しなかった"
 
         f_reg = pc.cpu.f
@@ -175,7 +169,7 @@ class TestSDInit:
 # ---------------------------------------------------------------
 
 class TestSDReadBlock:
-    """SD_READ_BLOCK (0xEC03) の動作テスト"""
+    """SD_READ_BLOCK の動作テスト"""
 
     def test_read_block_returns_correct_data(self):
         """
@@ -189,18 +183,19 @@ class TestSDReadBlock:
         sd.write_block(5, pattern)
 
         # SD_INIT を実行してカードを初期化
-        halted = _call_addr(pc, SD_INIT_VEC)
+        halted = _call_addr(pc, sym('SD_INIT'))
         assert halted, "SD_INIT: HALT に到達しなかった"
 
         # DE=0, HL=5 に設定して SD_READ_BLOCK を CALL
-        # トランポリンコード: LD DE,0; LD HL,5; CALL SD_READ_VEC; HALT
+        # トランポリンコード: LD DE,0; LD HL,5; CALL SD_READ_BLOCK; HALT
+        sd_read_vec = sym('SD_READ_BLOCK')
         trampoline = 0xD000
         code = [
             0x11, 0x00, 0x00,   # LD DE, 0x0000
             0x21, 0x05, 0x00,   # LD HL, 0x0005
             0xCD,               # CALL nn
-            SD_READ_VEC & 0xFF,
-            (SD_READ_VEC >> 8) & 0xFF,
+            sd_read_vec & 0xFF,
+            (sd_read_vec >> 8) & 0xFF,
             0x76,               # HALT
         ]
         pc.load(trampoline, bytes(code))
@@ -216,7 +211,8 @@ class TestSDReadBlock:
         assert carry == 0, f"SD_READ_BLOCK: CY={carry} (expected 0)"
 
         # SD_BUF の内容がパターンと一致する
-        buf_data = bytes(pc._mem_read(SD_BUF_ADDR + i) for i in range(512))
+        sd_buf = sym('SD_BUF')
+        buf_data = bytes(pc._mem_read(sd_buf + i) for i in range(512))
         assert buf_data == pattern, (
             f"SD_BUF mismatch: "
             f"first bytes got {list(buf_data[:8])}, expected {list(pattern[:8])}"
@@ -233,17 +229,18 @@ class TestSDReadBlock:
         marker_data[511] = 0x77
         sd.write_block(0, bytes(marker_data))
 
-        halted = _call_addr(pc, SD_INIT_VEC)
+        halted = _call_addr(pc, sym('SD_INIT'))
         assert halted, "SD_INIT: HALT に到達しなかった"
 
         # DE=0, HL=0
+        sd_read_vec = sym('SD_READ_BLOCK')
         trampoline = 0xD000
         code = [
             0x11, 0x00, 0x00,   # LD DE, 0x0000
             0x21, 0x00, 0x00,   # LD HL, 0x0000
             0xCD,
-            SD_READ_VEC & 0xFF,
-            (SD_READ_VEC >> 8) & 0xFF,
+            sd_read_vec & 0xFF,
+            (sd_read_vec >> 8) & 0xFF,
             0x76,
         ]
         pc.load(trampoline, bytes(code))
@@ -253,9 +250,10 @@ class TestSDReadBlock:
         halted = pc.run_until_halt(max_steps=5000000)
         assert halted, "SD_READ_BLOCK(LBA=0): HALT に到達しなかった"
 
-        assert pc._mem_read(SD_BUF_ADDR + 0) == 0xAA
-        assert pc._mem_read(SD_BUF_ADDR + 1) == 0x55
-        assert pc._mem_read(SD_BUF_ADDR + 511) == 0x77
+        sd_buf = sym('SD_BUF')
+        assert pc._mem_read(sd_buf + 0) == 0xAA
+        assert pc._mem_read(sd_buf + 1) == 0x55
+        assert pc._mem_read(sd_buf + 511) == 0x77
 
 
 # ---------------------------------------------------------------
@@ -263,7 +261,7 @@ class TestSDReadBlock:
 # ---------------------------------------------------------------
 
 class TestSDWriteBlock:
-    """SD_WRITE_BLOCK (0xEC06) の動作テスト"""
+    """SD_WRITE_BLOCK の動作テスト"""
 
     def test_write_block_writes_to_sd_image(self):
         """
@@ -273,21 +271,22 @@ class TestSDWriteBlock:
         pc, sd = setup_sd()
 
         # SD 初期化
-        halted = _call_addr(pc, SD_INIT_VEC)
+        halted = _call_addr(pc, sym('SD_INIT'))
         assert halted, "SD_INIT: HALT に到達しなかった"
 
         # SD_BUF に書き込みデータを設定
         write_data = bytes([(i * 7 + 0x11) & 0xFF for i in range(512)])
-        pc.load(SD_BUF_ADDR, write_data)
+        pc.load(sym('SD_BUF'), write_data)
 
         # DE=0, HL=7 に設定して SD_WRITE_BLOCK を CALL (ブロック7)
+        sd_write_vec = sym('SD_WRITE_BLOCK')
         trampoline = 0xD000
         code = [
             0x11, 0x00, 0x00,   # LD DE, 0x0000
             0x21, 0x07, 0x00,   # LD HL, 0x0007
             0xCD,
-            SD_WRITE_VEC & 0xFF,
-            (SD_WRITE_VEC >> 8) & 0xFF,
+            sd_write_vec & 0xFF,
+            (sd_write_vec >> 8) & 0xFF,
             0x76,               # HALT
         ]
         pc.load(trampoline, bytes(code))
@@ -316,21 +315,24 @@ class TestSDWriteBlock:
         pc, sd = setup_sd()
 
         # SD 初期化
-        halted = _call_addr(pc, SD_INIT_VEC)
+        halted = _call_addr(pc, sym('SD_INIT'))
         assert halted, "SD_INIT: HALT に到達しなかった"
 
         # 書き込みデータを SD_BUF に設定
         write_data = bytes([(255 - (i & 0xFF)) for i in range(512)])
-        pc.load(SD_BUF_ADDR, write_data)
+        sd_buf = sym('SD_BUF')
+        pc.load(sd_buf, write_data)
 
         # SD_WRITE_BLOCK (ブロック3)
+        sd_write_vec = sym('SD_WRITE_BLOCK')
+        sd_read_vec = sym('SD_READ_BLOCK')
         trampoline = 0xD000
         code = [
             0x11, 0x00, 0x00,   # LD DE, 0x0000
             0x21, 0x03, 0x00,   # LD HL, 0x0003
             0xCD,
-            SD_WRITE_VEC & 0xFF,
-            (SD_WRITE_VEC >> 8) & 0xFF,
+            sd_write_vec & 0xFF,
+            (sd_write_vec >> 8) & 0xFF,
             0x76,
         ]
         pc.load(trampoline, bytes(code))
@@ -342,15 +344,15 @@ class TestSDWriteBlock:
         assert (pc.cpu.f & 1) == 0, "SD_WRITE_BLOCK(RT): CY=1"
 
         # SD_BUF をゼロクリアして上書きを確認
-        pc.load(SD_BUF_ADDR, bytes(512))
+        pc.load(sd_buf, bytes(512))
 
         # SD_READ_BLOCK (ブロック3)
         code = [
             0x11, 0x00, 0x00,   # LD DE, 0x0000
             0x21, 0x03, 0x00,   # LD HL, 0x0003
             0xCD,
-            SD_READ_VEC & 0xFF,
-            (SD_READ_VEC >> 8) & 0xFF,
+            sd_read_vec & 0xFF,
+            (sd_read_vec >> 8) & 0xFF,
             0x76,
         ]
         pc.load(trampoline, bytes(code))
@@ -362,7 +364,7 @@ class TestSDWriteBlock:
         assert (pc.cpu.f & 1) == 0, "SD_READ_BLOCK(RT): CY=1"
 
         # 読み返したデータが一致するか
-        buf_data = bytes(pc._mem_read(SD_BUF_ADDR + i) for i in range(512))
+        buf_data = bytes(pc._mem_read(sd_buf + i) for i in range(512))
         assert buf_data == write_data, (
             f"往復テスト mismatch: "
             f"first bytes got {list(buf_data[:8])}, expected {list(write_data[:8])}"
