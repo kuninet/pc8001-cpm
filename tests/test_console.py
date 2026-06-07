@@ -11,8 +11,10 @@ import pytest
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from emu.pc8001 import PC8001, VRAM_BASE, VRAM_ROW_BYTES
+from bios_syms import sym
 
 # ---------------------------------------------------------------
 # BIOS 定数
@@ -113,13 +115,8 @@ def vram_row(pc: PC8001, row: int, cols: int = 80) -> bytes:
 
 
 def _bios_data_addrs() -> tuple:
-    """BIOS内データ領域(CUR_ROW, CUR_COL, ESC_STATE, KEYBUF)のアドレスを返す。"""
-    with open(BIOS_BIN, "rb") as f:
-        data = f.read()
-    signon = b"PC-8001 CP/M 2.2 BIOS\x00"
-    pos = data.find(signon)
-    cur_row = BIOS_ORG + pos + len(signon)
-    return cur_row, cur_row + 1, cur_row + 2, cur_row + 3
+    """BIOS内データ領域(CUR_ROW, CUR_COL, ESC_STATE, KEYBUF)のアドレスをシンボルから返す。"""
+    return sym('CUR_ROW'), sym('CUR_COL'), sym('ESC_STATE'), sym('KEYBUF')
 
 
 # ---------------------------------------------------------------
@@ -133,6 +130,8 @@ class TestBoot:
         """BOOT後: VRAM の全行が空白(0x20)またはサインオン文字。"""
         instance = PC8001()
         _load_bios(instance)
+        # BOOT は最後に JP 0xD300(CCP) へジャンプするので、0xD300 に HALT を置く
+        instance.load(0xD300, bytes([0x76]))
         instance.set_pc(BIOS_ORG)
         instance.run_until_halt(max_steps=500000)
 
@@ -147,6 +146,8 @@ class TestBoot:
         """BOOT後: 全行のアトリビュート40バイトが 0x00。"""
         instance = PC8001()
         _load_bios(instance)
+        # BOOT は最後に JP 0xD300(CCP) へジャンプするので、0xD300 に HALT を置く
+        instance.load(0xD300, bytes([0x76]))
         instance.set_pc(BIOS_ORG)
         instance.run_until_halt(max_steps=500000)
 

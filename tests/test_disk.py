@@ -10,9 +10,11 @@ import pytest
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from emu.pc8001 import PC8001
 from emu.sdcard import SDCard
+from bios_syms import sym
 
 # ---------------------------------------------------------------
 # 定数
@@ -25,21 +27,6 @@ BUILD_DIR = os.path.join(PROJECT_ROOT, "build")
 # BIOS ジャンプテーブル: vec(n) = 0xE900 + 3*n
 def vec(n: int) -> int:
     return BIOS_ORG + 3 * n
-
-# ディスク層ワーク変数アドレス
-CUR_DISK_ADDR    = 0xF001
-CUR_TRACK_ADDR   = 0xF002
-CUR_SECTOR_ADDR  = 0xF004
-CUR_DMA_ADDR     = 0xF006
-BUF_LBA_ADDR     = 0xF008
-BUF_DIRTY_ADDR   = 0xF00C
-
-# DPHテーブル先頭 (ドライブA=0がDPH0)
-DPH_TABLE_ADDR   = 0xF0B0
-
-# SD ドライバ固定アドレス
-SD_INIT_VEC  = 0xEC00
-SD_BUF_ADDR  = 0xEE00
 
 # ---------------------------------------------------------------
 # LBA 計算ヘルパ (BIOS の CALC_LBA と同じ計算)
@@ -105,7 +92,7 @@ def setup_disk():
     pc.attach_sd(sd)
     _load_bios(pc)
     # SD 初期化
-    _call_addr(pc, SD_INIT_VEC)
+    _call_addr(pc, sym('SD_INIT'))
     return pc, sd
 
 
@@ -165,8 +152,9 @@ class TestSeldsk:
         pc, _ = setup_disk()
         halted = _call_with_regs(pc, vec(9), bc=0x0000)  # C=0
         assert halted, "HALT に到達しなかった"
-        assert pc.cpu.hl == DPH_TABLE_ADDR, (
-            f"SELDSK(A): HL=0x{pc.cpu.hl:04X} (expected 0x{DPH_TABLE_ADDR:04X})"
+        dph_table_addr = sym('DPH_TABLE')
+        assert pc.cpu.hl == dph_table_addr, (
+            f"SELDSK(A): HL=0x{pc.cpu.hl:04X} (expected 0x{dph_table_addr:04X})"
         )
 
     def test_drive_h_returns_dph(self):
@@ -174,7 +162,8 @@ class TestSeldsk:
         pc, _ = setup_disk()
         halted = _call_with_regs(pc, vec(9), bc=0x0007)  # C=7
         assert halted, "HALT に到達しなかった"
-        expected = DPH_TABLE_ADDR + 7 * 16
+        dph_table_addr = sym('DPH_TABLE')
+        expected = dph_table_addr + 7 * 16
         assert pc.cpu.hl == expected, (
             f"SELDSK(H): HL=0x{pc.cpu.hl:04X} (expected 0x{expected:04X})"
         )
@@ -190,7 +179,7 @@ class TestSeldsk:
         """C=3 で CUR_DISK ワーク変数が 3 に更新される。"""
         pc, _ = setup_disk()
         _call_with_regs(pc, vec(9), bc=0x0003)
-        cur_disk = pc._mem_read(CUR_DISK_ADDR)
+        cur_disk = pc._mem_read(sym('CUR_DISK'))
         assert cur_disk == 3, f"CUR_DISK={cur_disk} (expected 3)"
 
 
@@ -205,21 +194,21 @@ class TestSetters:
         """SETTRK(vec10): BC=0x0005 → CUR_TRACK=5。"""
         pc, _ = setup_disk()
         _call_with_regs(pc, vec(10), bc=0x0005)
-        val = _mem_read16(pc, CUR_TRACK_ADDR)
+        val = _mem_read16(pc, sym('CUR_TRACK'))
         assert val == 5, f"CUR_TRACK={val} (expected 5)"
 
     def test_setsec_updates_cur_sector(self):
         """SETSEC(vec11): BC=0x003F → CUR_SECTOR=63。"""
         pc, _ = setup_disk()
         _call_with_regs(pc, vec(11), bc=0x003F)
-        val = _mem_read16(pc, CUR_SECTOR_ADDR)
+        val = _mem_read16(pc, sym('CUR_SECTOR'))
         assert val == 63, f"CUR_SECTOR={val} (expected 63)"
 
     def test_setdma_updates_cur_dma(self):
         """SETDMA(vec12): BC=0x8100 → CUR_DMA=0x8100。"""
         pc, _ = setup_disk()
         _call_with_regs(pc, vec(12), bc=0x8100)
-        val = _mem_read16(pc, CUR_DMA_ADDR)
+        val = _mem_read16(pc, sym('CUR_DMA'))
         assert val == 0x8100, f"CUR_DMA=0x{val:04X} (expected 0x8100)"
 
 
@@ -342,7 +331,7 @@ class TestWrite:
         assert pc.cpu.a == 0, f"WRITE: A={pc.cpu.a} (expected 0=success)"
 
         # BUF_DIRTY が 0 (即時フラッシュ済み)
-        dirty = pc._mem_read(BUF_DIRTY_ADDR)
+        dirty = pc._mem_read(sym('BUF_DIRTY'))
         assert dirty == 0, f"BUF_DIRTY={dirty} (expected 0 after dir write)"
 
         # SD image の LBA32 先頭128バイトが write_pattern と一致
@@ -385,7 +374,7 @@ class TestWrite:
         assert pc.cpu.a == 0, f"WRITE(normal): A={pc.cpu.a}"
 
         # BUF_DIRTY = 1
-        dirty = pc._mem_read(BUF_DIRTY_ADDR)
+        dirty = pc._mem_read(sym('BUF_DIRTY'))
         assert dirty == 1, f"BUF_DIRTY={dirty} (expected 1 for delayed write)"
 
 
