@@ -14,7 +14,7 @@ EMU_PYTHONPATH := external/z80
 
 BUILD := build
 
-.PHONY: all setup smoke clean
+.PHONY: all setup smoke clean fetch-cpm cpm check-setup check-cpm
 
 all: smoke
 
@@ -42,6 +42,34 @@ check-setup:
 # --- 疎通テスト ---
 smoke: check-setup $(BUILD)/smoke.bin
 	PYTHONPATH=$(EMU_PYTHONPATH) $(PY) tests/smoke_emu.py $(BUILD)/smoke.bin
+
+# --- CP/M 本体 (CCP/BDOS) 取得・ビルド ---
+# 取得: external/cpm22 (gitignore 対象) へ
+fetch-cpm:
+	./scripts/fetch_cpm.sh
+
+# 配置アドレスは #4(メモリマップ詳細設計)で確定する。
+# 以下は 44K システムの例(暫定・ビルド機構の実証用)。実値は #4 確定後に上書きする。
+# ORG を変えるときは対応する RANGE もセットで更新すること。
+CPM_SRC    := external/cpm22
+CCP_ORG    ?= 9400h
+CCP_RANGE  ?= $$9400-$$9bff
+BDOS_ORG   ?= 9c00h
+BDOS_RANGE ?= $$9c00-$$a9ff
+
+check-cpm:
+	@test -f $(CPM_SRC)/ccp.asm || { echo "ERROR: $(CPM_SRC) がありません。先に 'make fetch-cpm' を実行してください。"; exit 1; }
+
+cpm: check-cpm $(BUILD)/ccp.bin $(BUILD)/bdos.bin
+	@echo "CCP/BDOS ビルド完了 (CCP_ORG=$(CCP_ORG) BDOS_ORG=$(BDOS_ORG))"
+
+$(BUILD)/ccp.bin: $(CPM_SRC)/ccp.asm | $(BUILD)
+	$(AS) -D origin=$(CCP_ORG) -o $(BUILD)/ccp.p $<
+	$(P2BIN) -l '$$00' -r '$(CCP_RANGE)' $(BUILD)/ccp.p $@
+
+$(BUILD)/bdos.bin: $(CPM_SRC)/bdos.asm | $(BUILD)
+	$(AS) -D origin=$(BDOS_ORG) -o $(BUILD)/bdos.p $<
+	$(P2BIN) -l '$$00' -r '$(BDOS_RANGE)' $(BUILD)/bdos.p $@
 
 clean:
 	rm -rf $(BUILD)
