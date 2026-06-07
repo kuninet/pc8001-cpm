@@ -757,4 +757,436 @@ KEYBUF:
 	DB	0
 
 ;==============================================================
-; SDブロックドライバ固定ジャンプテーブル
+; SDブロックドライバ(#33)固定ジャンプテーブル
+;   SD_INIT_VEC  = 0EC00h  (CALL 0EC00h でSD初期化)
+;   SD_READ_VEC  = 0EC03h  (CALL 0EC03h でブロック読込)
+;   SD_WRITE_VEC = 0EC06h  (CALL 0EC06h でブロック書込)
+;==============================================================
+	org	0EC00h
+
+SD_INIT_VEC:
+	JP	SD_INIT		; 0: SD初期化
+SD_READ_VEC:
+	JP	SD_READ_BLOCK	; 3: ブロック読込
+SD_WRITE_VEC:
+	JP	SD_WRITE_BLOCK	; 6: ブロック書込
+
+;==============================================================
+; SDブロックドライバ実装
+;   8255 ポート割当 (SD-DOS互換):
+;     PA=0xFC, PB=0xFD, PC=0xFE, CTL=0xFF
+;     制御ワード = 0x88 (MODE0/A=IN/B=OUT/CH=IN/CL=OUT)
+;     PB bit0=CLK, bit1=MOSI, bit2=CS(負論理), bit3=LED
+;     PC bit4=MISO
+;==============================================================
+
+;--------------------------------------------------------------
+; SD_INIT_PORTS: 8255初期化
+;   CTLに0x88設定、PBを0xFF(CS=High, CLK=High, MOSI=High, LED=High)
+;--------------------------------------------------------------
+SD_INIT_PORTS:
+	LD	A, 88h
+	OUT	(0FFh), A		; 8255制御ワード設定
+	LD	A, 0FFh
+	OUT	(0FDh), A		; PB初期値(CS=High)
+	RET
+
+;--------------------------------------------------------------
+; SD_CS_LOW: CS をアサート(bit2=0)
+;--------------------------------------------------------------
+SD_CS_LOW:
+	IN	A, (0FDh)
+	AND	11111011B		; bit2=0(CSアサート)
+	OUT	(0FDh), A
+	RET
+
+;--------------------------------------------------------------
+; SD_CS_HIGH: CS をネゲート(bit2=1)
+;--------------------------------------------------------------
+SD_CS_HIGH:
+	IN	A, (0FDh)
+	OR	00000100B		; bit2=1(CSネゲート)
+	OUT	(0FDh), A
+	RET
+
+;--------------------------------------------------------------
+; SD_SPI_OUT: 1バイト送受信(MSBファースト, SPI mode0)
+;   入力: C = 送信バイト
+;   出力: A = 受信バイト, D = 受信バイト(コピー)
+;   破壊: AF, D
+;   保存: BC, HL (PUSH/POP)
+;   注意: CS=0 を維持したまま呼ぶこと
+;--------------------------------------------------------------
+SD_SPI_OUT:
+	PUSH	BC
+	PUSH	HL
+	; ベース値をLに格納: CS/LED現在値を保持してCLK=0, MOSI=0
+	IN	A, (0FDh)
+	AND	11111100B		; CLK=0, MOSI=0 クリア(CS/LEDは保持)
+	LD	L, A			; L = ベース値(CS=0, LED=1保持)
+	LD	D, 0			; D = 受信シフトレジスタ
+	LD	H, 8			; H = ビットカウンタ
+SPI_OUT_LOOP:
+	; MOSI bit設定: CのMSBをbit1へ(SLAでCYに取り出す)
+	LD	A, L
+	AND	11111101B		; MOSI=0クリア
+	SLA	C			; MSBをCYへ, C左シフト(LSB=0)
+	JR	NC, SPI_OUT_CLK0	; CY=0: MOSI=0
+	OR	00000010B		; CY=1: MOSI=1
+SPI_OUT_CLK0:
+	; CLK=0 で書き出す(CLKはベース値で既に0)
+	OUT	(0FDh), A
+	LD	L, A			; L更新(MOSI含む)
+	; CLK立上り
+	OR	00000001B		; CLK=1
+	OUT	(0FDh), A
+	; MISO読み取り(CLK=1の後)
+	SLA	D			; D左シフト(LSB=0)
+	IN	A, (0FEh)
+	AND	00010000B		; bit4=MISO, ZF: MISO=0ならZ
+	JR	Z, SPI_OUT_MISO0	; MISO=0: Dのbit0=0のまま
+	INC	D			; MISO=1: D.bit0=1
+SPI_OUT_MISO0:
+	; CLK立下り
+	LD	A, L
+	AND	11111110B		; CLK=0
+	OUT	(0FDh), A
+	LD	L, A			; L更新
+	DEC	H
+	JR	NZ, SPI_OUT_LOOP
+	LD	A, D			; 受信バイトをAに
+	POP	HL
+	POP	BC
+	RET
+
+;--------------------------------------------------------------
+; SD_SPI_IN: 0xFFを送って1バイト受信
+;   出力: A = 受信バイト
+;   保存: BC (LD C,0FFh で C を書き換えるので PUSH/POP で保護)
+;--------------------------------------------------------------
+SD_SPI_IN:
+	PUSH	BC
+	LD	C, 0FFh
+	CALL	SD_SPI_OUT
+	POP	BC
+	RET
+
+;--------------------------------------------------------------
+; SD_SEND_CMD: コマンドフレーム送信
+;   入力: HL = 6バイトコマンド構造体ポインタ
+;         (cmd|0x40, arg3, arg2, arg1, arg0, crc)
+;   破壊: AF, B, C, D, H, HL
+;--------------------------------------------------------------
+SD_SEND_CMD:
+	LD	B, 6			; 6バイト送信
+SEND_CMD_LOOP:
+	LD	C, (HL)
+	CALL	SD_SPI_OUT
+	INC	HL
+	DJNZ	SEND_CMD_LOOP
+	RET
+
+
+;--------------------------------------------------------------
+; SD_INIT: SD カード初期化
+;   出力: CY=0 成功 / CY=1 失敗
+;   破壊: AF, BC, DE, HL
+;--------------------------------------------------------------
+SD_INIT:
+	CALL	SD_INIT_PORTS
+
+	; CS=High で 0xFF を 10回送信(74クロック以上のダミー)
+	LD	B, 10
+SD_INIT_DUMMY:
+	CALL	SD_SPI_IN
+	DJNZ	SD_INIT_DUMMY
+
+	; CS=Low
+	CALL	SD_CS_LOW
+
+	; CMD0送信(GO_IDLE_STATE, CRC=0x95)
+	LD	HL, SD_CMD0
+	CALL	SD_SEND_CMD
+	; R1ポーリング: 0x01を期待
+	CALL	SD_POLL_R1
+	JR	C, SD_INIT_FAIL		; タイムアウト
+	CP	01h
+	JR	NZ, SD_INIT_FAIL	; R1≠0x01
+
+	; CMD8送信(SEND_IF_COND, arg=0x000001AA, CRC=0x87)
+	LD	HL, SD_CMD8
+	CALL	SD_SEND_CMD
+	; R1ポーリング: 0x01を期待
+	CALL	SD_POLL_R1
+	JR	C, SD_INIT_FAIL
+	CP	01h
+	JR	NZ, SD_INIT_FAIL
+	; R7 4バイト受信: 最後のバイトが0xAAか確認
+	CALL	SD_SPI_IN		; R7[0]
+	CALL	SD_SPI_IN		; R7[1]
+	CALL	SD_SPI_IN		; R7[2]
+	CALL	SD_SPI_IN		; R7[3] → A
+	CP	0AAh
+	JR	NZ, SD_INIT_FAIL
+
+	; ACMD41ループ(最大256回)
+	LD	B, 0			; Bカウンタ(0=256回)
+SD_ACMD41_LOOP:
+	; CMD55
+	LD	HL, SD_CMD55
+	CALL	SD_SEND_CMD
+	CALL	SD_POLL_R1
+	JR	C, SD_INIT_FAIL
+	; ACMD41(arg=0x40000000)
+	LD	HL, SD_CMD41
+	CALL	SD_SEND_CMD
+	CALL	SD_POLL_R1
+	JR	C, SD_INIT_FAIL
+	CP	00h
+	JR	Z, SD_ACMD41_DONE	; R1==0x00: 初期化完了
+	DJNZ	SD_ACMD41_LOOP
+	JR	SD_INIT_FAIL		; タイムアウト
+
+SD_ACMD41_DONE:
+	; CMD58(READ_OCR)
+	LD	HL, SD_CMD58
+	CALL	SD_SEND_CMD
+	CALL	SD_POLL_R1
+	JR	C, SD_INIT_FAIL
+	CP	00h
+	JR	NZ, SD_INIT_FAIL
+	; OCR 4バイト受信: 先頭バイトのbit6=CCS
+	CALL	SD_SPI_IN		; OCR[0]
+	PUSH	AF			; OCR[0]保存
+	CALL	SD_SPI_IN		; OCR[1]
+	CALL	SD_SPI_IN		; OCR[2]
+	CALL	SD_SPI_IN		; OCR[3]
+	POP	AF			; OCR[0]
+	AND	40h			; bit6=CCS
+	LD	(SD_CCS), A		; CCS保存(非0=SDHC)
+
+	; CCS=0ならCMD16でブロック長512設定
+	JR	NZ, SD_INIT_OK		; CCS≠0(SDHC): スキップ
+	LD	HL, SD_CMD16
+	CALL	SD_SEND_CMD
+	CALL	SD_POLL_R1
+	; CMD16失敗は無視(v1カードがない場合)
+
+SD_INIT_OK:
+	CALL	SD_CS_HIGH
+	OR	A			; CY=0
+	CCF				; CY=0確定(OR Aでクリアされているため不要だが明示)
+	XOR	A			; A=0, CY=0
+	RET
+
+SD_INIT_FAIL:
+	CALL	SD_CS_HIGH
+	SCF				; CY=1
+	RET
+
+;--------------------------------------------------------------
+; SD_POLL_R1: R1レスポンスをポーリング取得
+;   最大16回試行、MSB=0のバイトを返す
+;   出力: A = R1, CY=0 成功 / A=0xFF, CY=1 タイムアウト
+;   破壊: AF
+;--------------------------------------------------------------
+SD_POLL_R1:
+	PUSH	BC
+	LD	B, 16
+SD_PR1_LOOP:
+	CALL	SD_SPI_IN
+	BIT	7, A
+	JR	Z, SD_PR1_OK		; bit7=0: 有効なR1
+	DJNZ	SD_PR1_LOOP
+	; タイムアウト
+	POP	BC
+	LD	A, 0FFh
+	SCF				; CY=1
+	RET
+SD_PR1_OK:
+	POP	BC
+	OR	A			; CY=0
+	RET
+
+;--------------------------------------------------------------
+; SD_READ_BLOCK: ブロック読込
+;   入力: DE:HL = LBA(DE=上位16bit, HL=下位16bit)
+;   出力: CY=0 成功(データはSD_BUFへ) / CY=1 失敗
+;   破壊: AF, BC, HL
+;--------------------------------------------------------------
+SD_READ_BLOCK:
+	; LBAをコマンドバッファに書き込む (IX使用)
+	PUSH	IX
+	LD	IX, SD_RD_ARG
+	LD	(IX+0), D		; arg[0]=LBA上位上位
+	LD	(IX+1), E		; arg[1]=LBA上位下位
+	LD	(IX+2), H		; arg[2]=LBA下位上位
+	LD	(IX+3), L		; arg[3]=LBA下位下位
+	POP	IX
+
+	CALL	SD_CS_LOW
+
+	; CMD17(READ_SINGLE_BLOCK)送信
+	LD	HL, SD_CMD17
+	CALL	SD_SEND_CMD
+	; R1チェック
+	CALL	SD_POLL_R1
+	JR	C, SD_RB_FAIL
+	CP	00h
+	JR	NZ, SD_RB_FAIL
+
+	; データトークン 0xFE を待つ(最大64回)
+	LD	B, 64
+SD_RB_TOKEN_WAIT:
+	CALL	SD_SPI_IN
+	CP	0FEh
+	JR	Z, SD_RB_DATA		; トークン受信
+	DJNZ	SD_RB_TOKEN_WAIT
+	JR	SD_RB_FAIL		; タイムアウト
+
+SD_RB_DATA:
+	; 512バイト受信 → SD_BUFへ
+	; アドレス比較でループ終端判定(BC使用回避: SD_SPI_INがCを変更するため)
+	LD	HL, SD_BUF		; HL = 0xEE00
+SD_RB_RECV_LOOP:
+	CALL	SD_SPI_IN
+	LD	(HL), A
+	INC	HL
+	; HL == 0xF000(SD_BUF+512) になったら終了
+	LD	A, H
+	CP	0F0h
+	JR	NZ, SD_RB_RECV_LOOP
+
+	; CRC 2バイト読み捨て
+	CALL	SD_SPI_IN
+	CALL	SD_SPI_IN
+
+	CALL	SD_CS_HIGH
+	XOR	A			; CY=0
+	RET
+
+SD_RB_FAIL:
+	CALL	SD_CS_HIGH
+	SCF				; CY=1
+	RET
+
+;--------------------------------------------------------------
+; SD_WRITE_BLOCK: ブロック書込
+;   入力: DE:HL = LBA, データソースはSD_BUF
+;   出力: CY=0 成功 / CY=1 失敗
+;   破壊: AF, BC, HL
+;--------------------------------------------------------------
+SD_WRITE_BLOCK:
+	; LBAをコマンドバッファに書き込む (IX使用)
+	PUSH	IX
+	LD	IX, SD_WR_ARG
+	LD	(IX+0), D
+	LD	(IX+1), E
+	LD	(IX+2), H
+	LD	(IX+3), L
+	POP	IX
+
+	CALL	SD_CS_LOW
+
+	; CMD24(WRITE_SINGLE_BLOCK)送信
+	LD	HL, SD_CMD24
+	CALL	SD_SEND_CMD
+	; R1チェック
+	CALL	SD_POLL_R1
+	JR	C, SD_WB_FAIL
+	CP	00h
+	JR	NZ, SD_WB_FAIL
+
+	; データトークン 0xFE 送信
+	LD	C, 0FEh
+	CALL	SD_SPI_OUT
+
+	; SD_BUFから512バイト送信
+	; アドレス比較でループ終端判定(BCカウンタ回避: LD C,(HL)がCを変更するため)
+	LD	HL, SD_BUF		; HL = 0xEE00
+SD_WB_SEND_LOOP:
+	LD	C, (HL)
+	CALL	SD_SPI_OUT
+	INC	HL
+	; HL == 0xF000(SD_BUF+512) になったら終了
+	LD	A, H
+	CP	0F0h
+	JR	NZ, SD_WB_SEND_LOOP
+
+	; CRC 2バイト送信(ダミー)
+	LD	C, 00h
+	CALL	SD_SPI_OUT
+	LD	C, 00h
+	CALL	SD_SPI_OUT
+
+	; データレスポンス受信(下位5bit=0b00101確認)
+	CALL	SD_POLL_R1		; データレスポンスをポーリング
+	JR	C, SD_WB_FAIL
+	AND	1Fh			; 下位5bit
+	CP	05h			; 0b00101 = accepted
+	JR	NZ, SD_WB_FAIL
+
+	; busy待ち(0xFFが来るまで最大256回)
+	LD	B, 0
+SD_WB_BUSY_WAIT:
+	CALL	SD_SPI_IN
+	CP	0FFh
+	JR	Z, SD_WB_OK
+	DJNZ	SD_WB_BUSY_WAIT
+	JR	SD_WB_FAIL
+
+SD_WB_OK:
+	CALL	SD_CS_HIGH
+	XOR	A			; CY=0
+	RET
+
+SD_WB_FAIL:
+	CALL	SD_CS_HIGH
+	SCF				; CY=1
+	RET
+
+;--------------------------------------------------------------
+; SDコマンドフレームテーブル
+;--------------------------------------------------------------
+SD_CMD0:
+	DB	40h, 00h, 00h, 00h, 00h, 95h	; CMD0: GO_IDLE_STATE
+
+SD_CMD8:
+	DB	48h, 00h, 00h, 01h, 0AAh, 87h	; CMD8: SEND_IF_COND (VHS=1, 0xAA)
+
+SD_CMD55:
+	DB	77h, 00h, 00h, 00h, 00h, 0FFh	; CMD55: APP_CMD
+
+SD_CMD41:
+	DB	69h, 40h, 00h, 00h, 00h, 0FFh	; ACMD41: SD_SEND_OP_COND(HCS=1)
+
+SD_CMD58:
+	DB	7Ah, 00h, 00h, 00h, 00h, 0FFh	; CMD58: READ_OCR
+
+SD_CMD16:
+	DB	50h, 00h, 00h, 02h, 00h, 0FFh	; CMD16: SET_BLOCKLEN 512
+
+SD_CMD17:
+	DB	51h			; CMD17: READ_SINGLE_BLOCK
+SD_RD_ARG:
+	DB	00h, 00h, 00h, 00h	; arg (動的書き換え)
+	DB	0FFh			; CRC
+
+SD_CMD24:
+	DB	58h			; CMD24: WRITE_SINGLE_BLOCK
+SD_WR_ARG:
+	DB	00h, 00h, 00h, 00h	; arg (動的書き換え)
+	DB	0FFh			; CRC
+
+;--------------------------------------------------------------
+; SD用データ領域 (固定アドレス 0xEE00)
+;--------------------------------------------------------------
+	org	0EE00h
+
+SD_BUF:
+	DS	512			; 512バイトブロックバッファ
+
+SD_CCS:
+	DB	0			; カード種別 (0=SDSC, 非0=SDHC)
+
+	end
