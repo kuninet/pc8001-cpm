@@ -327,3 +327,45 @@ class TestLoaderBoot:
                 f"BDOS LBA{BDOS_LBA_START + i}: "
                 f"addr=0x{addr:04X} = {val:#04x} (expected {pat:#04x})"
             )
+
+
+class TestLoaderSDFailure:
+    """SD初期化失敗時にローダがHANGすることを確認"""
+
+    def test_loader_hangs_when_sd_not_attached(self):
+        """
+        SDCard未接続時(pc.sd=None): SD_INITが必ず失敗するため
+        LOADER_HANG(無限JR $)に入る。
+        期待:
+          - run_until_halt は False (HALT到達しない)
+          - 0xE900 はロードされず初期値 0x00 のまま
+          - ゼロページ 0x0000 は書き換えられない(JP命令C3は書かれない)
+          - E2 は 0x10(書込許可のみ)で 0x11(ROM隠蔽)にはならない
+        """
+        pc = PC8001()
+        # 意図的に SDCard を attach しない
+        _load_loader_to_rom(pc)
+
+        pc.set_pc(LOADER_ORG)
+        # 十分なステップ実行(成功テストの max_steps と同じオーダー)
+        halted = pc.run_until_halt(max_steps=200000)
+
+        assert halted is False, "SD未接続でHALT到達してしまった(LOADER_HANGに入っていない)"
+
+        # BIOSは未ロード: 本体RAMの初期値=0x00
+        bios_byte = pc._mem_read(BIOS_ADDR)
+        assert bios_byte == 0x00, (
+            f"BIOS領域に何か書かれている: 0xE900={bios_byte:#04x}"
+        )
+
+        # ゼロページは初期化されていない(JP=0xC3 ではない)
+        # E2 bit4=1 のため bank_RAM(初期値0)が見える
+        zp0 = pc._mem_read(0x0000)
+        assert zp0 != 0xC3, (
+            f"ゼロページ 0x0000 が JP(0xC3) になっている: {zp0:#04x}"
+        )
+
+        # E2 は ROM隠蔽(0x11)になっていない: 書込許可(0x10)のままか初期値
+        assert pc.e2 != 0x11, (
+            f"E2 が 0x11 になっている(ROM隠蔽が走った): {pc.e2:#04x}"
+        )

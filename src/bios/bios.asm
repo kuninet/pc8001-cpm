@@ -64,14 +64,14 @@ BOOT:					; == 0E933h ==
 
 ;--------------------------------------------------------------
 ; WBOOT: ウォームブート (0E945h 固定)
-;   TODO: CCP/BDOS再ロード #10/#35
+;   CCP/BDOS を SD から再ロードしてゼロページを再設定、CCP へジャンプ
 ;--------------------------------------------------------------
 WBOOT:					; == 0E945h ==
-	HALT				; TODO: CCP/BDOS再ロード #10/#35
+	JP	WBOOT_BODY		; WBOOT本体へ (3B: 0xE945-0xE947)
 
 ;--------------------------------------------------------------
 ; BOOT_BODY: BOOT本体 (WBOOTの後に配置)
-;   CRTC初期化 → VRAMクリア → サインオン → HALT
+;   CRTC初期化 → VRAMクリア → サインオン → RST7スタブ設置 → HALT
 ;--------------------------------------------------------------
 BOOT_BODY:
 	; CRTC 初期化スタブ
@@ -80,11 +80,15 @@ BOOT_BODY:
 	; ならない可能性が高い(SCREEN FORMAT パラメータ未送出)。
 	; 80桁モード切替/カーソル設定/DMA設定/OCWは未対応。
 	; 実機/MAME での検証は #39 (CP-3) で確定する。
+	DI				; 割り込み禁止
 	LD	A, 00h
 	OUT	(51h), A		; ICW: RESET (スタブ値)
 
 	; VRAM クリア
 	CALL	CLS
+
+	; RST7スタブ設置
+	CALL	INSTALL_RST7_STUB
 
 	; サインオン文字列出力
 	LD	HL, SIGNON
@@ -688,6 +692,40 @@ KEYBUF:
 	DB	0
 
 ;==============================================================
+; ウォームブート補助ルーチン群 (0xEBE6-0xEBFF)
+;   KEYBUF(0xEBE5)の後、SDジャンプテーブル(0xEC00)の前に配置
+;==============================================================
+	org	0EBE6h
+
+;--------------------------------------------------------------
+; INSTALL_RST7_STUB: RST7ベクタ(0x0038)に安全スタブを設置
+;   割り込み発生時に即RETするスタブ(0xC9)を書き込む。
+;   ゼロページ書込は拡張RAM有効(e2 bit0=1, bit4=1)前提。
+;   破壊: AF
+;--------------------------------------------------------------
+INSTALL_RST7_STUB:
+	PUSH	AF
+	LD	A, 0C9h			; RET命令
+	LD	(0038h), A		; RST7ベクタに書き込む
+	POP	AF
+	RET
+
+;--------------------------------------------------------------
+; FLUSH_DIRTY_BUF: ダーティバッファをSDに書き戻す
+;   BUF_DIRTY != 0 なら DISK_FLUSH を呼ぶ。
+;   破壊: AF
+;--------------------------------------------------------------
+FLUSH_DIRTY_BUF:
+	PUSH	AF
+	LD	A, (BUF_DIRTY)
+	OR	A
+	JR	Z, FDB_DONE
+	CALL	DISK_FLUSH		; ディスク層の共通フラッシュ
+FDB_DONE:
+	POP	AF
+	RET
+
+;==============================================================
 ; SDブロックドライバ(#33)固定ジャンプテーブル
 ;   SD_INIT_VEC  = 0EC00h  (CALL 0EC00h でSD初期化)
 ;   SD_READ_VEC  = 0EC03h  (CALL 0EC03h でブロック読込)
@@ -1108,6 +1146,18 @@ SD_CMD24:
 SD_WR_ARG:
 	DB	00h, 00h, 00h, 00h	; arg (動的書き換え)
 	DB	0FFh			; CRC
+
+;--------------------------------------------------------------
+; ゼロページ設定データ (固定アドレス 0xEDEF)
+;   SDコマンドテーブル末尾(0xEDEE)の直後、SD_BUF(0xEE00)の前
+;   WBOOTのゼロページ初期化LDIR処理から参照する。
+;--------------------------------------------------------------
+	org	0EDEFh
+
+WB_ZP_DATA:
+	DB	0C3h, 03h, 0E9h		; 0x0000: JP 0xE903 (WBOOT)
+	DB	00h, 00h		; 0x0003-0x0004: IOBYTE=0, ドライブ=A
+	DB	0C3h, 06h, 0DBh		; 0x0005: JP 0xDB06 (BDOS)
 
 ;--------------------------------------------------------------
 ; SD用データ領域 (固定アドレス 0xEE00)
@@ -1620,6 +1670,78 @@ WRITE_FROM_DMA:
 	POP	HL
 	POP	DE
 	POP	BC
+	RET
+
+;==============================================================
+; ウォームブート本体・サブルーチン (#36, 0xF2B4以降)
+;   ディスクBIOS(0xF130-0xF2B3)の直後、VRAM(0xF300)の前に配置
+;==============================================================
+	org	0F2B4h
+
+;--------------------------------------------------------------
+; WBOOT_BODY: ウォームブート本体
+;   1. SPをBIOS専用スタック(0xF300)に設定(BDOSロード先0xE8FFより上)
+;   2. DI
+;   3. ダーティバッファフラッシュ
+;   4. SD から CCP/BDOS 再ロード(LBA5-15 → 0xD300-0xE8FF)
+;   5. ゼロページ再設定(0x0000-0x0007 LDIRで書込)
+;   6. RST7スタブ設置(INSTALL_RST7_STUB呼出)
+;   7. ワーク初期化(CUR_DISK=0, CUR_DMA=0x0080)
+;      (CUR_TRACK/CUR_SECTORはBDOSが常にSETTRK/SETSECで設定するため省略)
+;   8. CCP(0xD300)へジャンプ
+;--------------------------------------------------------------
+WBOOT_BODY:
+	LD	SP, 0F380h		; BIOS専用スタック(VRAM領域、BIOSコード末尾+余裕)
+	DI				; 割り込み禁止
+	CALL	FLUSH_DIRTY_BUF		; ダーティバッファフラッシュ
+	CALL	LOAD_CPM_FROM_SD	; CCP/BDOS 再ロード
+	; ゼロページ設定: LDIRで一括書込 (8バイト 0x0000-0x0007)
+	; 0x0003=IOBYTE=0, 0x0004=デフォルトドライブ=Aは意図的に0クリア
+	LD	HL, WB_ZP_DATA		; src = ZPデータテーブル
+	LD	DE, 0000h		; dst = 0x0000
+	LD	BC, 8
+	LDIR
+	; RST7ベクタ(0x0038)にRET命令を書込(INSTALL_RST7_STUBを再利用)
+	CALL	INSTALL_RST7_STUB
+	; ワーク初期化(必須分のみ)
+	XOR	A
+	LD	(CUR_DISK), A		; カレントドライブ = A(0)
+	LD	HL, 0080h
+	LD	(CUR_DMA), HL		; DMAアドレス = 0x0080(デフォルト)
+	; CCP(0xD300)へジャンプ
+	JP	0D300h
+
+;--------------------------------------------------------------
+; LOAD_CPM_FROM_SD: CCP/BDOSをSDから一括再ロード
+;   LBA5-15(11ブロック)を0xD300-0xE8FFへ連続ロード。
+;   CCP:  LBA5-8  → 0xD300-0xDAFF
+;   BDOS: LBA9-15 → 0xDB00-0xE8FF
+;   IX=LBAカウンタ(SD_READ_BLOCKで保存)、DE=dstアドレス
+;   SD_READ_BLOCK破壊: AF,BC,HL (DE・IXは保存される)
+;   LDIR後のDE(=旧dst+512)をそのまま次ループのdstとして使用。
+;--------------------------------------------------------------
+LOAD_CPM_FROM_SD:
+	LD	IX, 5			; IX = 開始LBA(5)
+	LD	DE, 0D300h		; DE = ロード先先頭(CCP=0xD300)
+	LD	B, 11			; B = ブロック数(11=CCP4+BDOS7)
+LCPM_LOOP:
+	PUSH	BC			; ブロック数を保存
+	PUSH	DE			; dstアドレスを保存
+	PUSH	IX
+	POP	HL			; HL = LBA(IXから転送)
+	LD	DE, 0			; LBA上位 = 0
+	CALL	SD_READ_BLOCK		; DE:HL=LBA → SD_BUF(512B)
+	POP	DE			; dstアドレス復元
+	POP	BC			; ブロック数復元
+	JR	C, LCPM_DONE		; 読込失敗時は中断
+	PUSH	BC			; ブロック数再保存(LDIRがBCを破壊)
+	LD	HL, SD_BUF		; src = SD_BUF
+	LD	BC, 512
+	LDIR				; 512バイト転送(DE→次ブロック先頭に自動更新)
+	POP	BC			; ブロック数復元
+	INC	IX			; LBA++
+	DJNZ	LCPM_LOOP
+LCPM_DONE:
 	RET
 
 	end
