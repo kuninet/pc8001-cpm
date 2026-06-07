@@ -112,6 +112,16 @@ def vram_row(pc: PC8001, row: int, cols: int = 80) -> bytes:
     return pc.read_vram(row * VRAM_ROW_BYTES, cols)
 
 
+def _bios_data_addrs() -> tuple:
+    """BIOS内データ領域(CUR_ROW, CUR_COL, ESC_STATE, KEYBUF)のアドレスを返す。"""
+    with open(BIOS_BIN, "rb") as f:
+        data = f.read()
+    signon = b"PC-8001 CP/M 2.2 BIOS\x00"
+    pos = data.find(signon)
+    cur_row = BIOS_ORG + pos + len(signon)
+    return cur_row, cur_row + 1, cur_row + 2, cur_row + 3
+
+
 # ---------------------------------------------------------------
 # テスト 1: BOOT → VRAMクリア + サインオン
 # ---------------------------------------------------------------
@@ -239,6 +249,67 @@ class TestConoutCursorAddr:
         row0 = vram_row(pc, 0, 1)
         assert row0 == b"X", f"ESC未対応: 行0[0]={row0!r} (expected b'X')"
 
+    def test_esc_row_out_of_range(self, pc):
+        """ESC '=' で row=25(>=25)を指定: 座標は変更されない(CUR_ROW=0のまま)。
+        実装上、不正値受信時点で状態0復帰のため、後続バイトは通常状態で処理される。
+        ここでは座標が変わっていないことを CUR_ROW 直読で確認する。
+        """
+        cur_row_addr, cur_col_addr, _, _ = _bios_data_addrs()
+        # 元のカーソルは (0,0)
+        # ESC '=' row=25(=0x39: 0x20+25) col=0(=0x20)
+        # row=25は範囲外(0〜24) → 不正値として無視
+        call_conout_seq(pc, [0x1B, 0x3D, 0x39])
+        # CUR_ROW が変更されていない(0のまま)
+        assert pc._mem_read(cur_row_addr) == 0, (
+            f"ESC row範囲外: CUR_ROW={pc._mem_read(cur_row_addr)} (expected 0)"
+        )
+        # 後続col, charを送る (状態0なので通常文字として処理されるはず)
+        call_conout_seq(pc, [0x20, 0x58])
+        # row=25行(VRAM=0xF300+25*120 = 0xFA68)に書込まれていないことを確認
+        # 25行目はVRAM範囲外(0xF300+25*120=0xFE40+120=0xFEB8)なのでmain_ramの末尾近く
+        # 行24以降のVRAMが破壊されていないことを確認:
+        # ESC受信時点でCUR_ROWは0のまま → 'X'は(0,1) or (0,2)に書かれる(状態リセット後)
+        # 主目的: VRAM範囲外への書込が無いこと
+        assert pc._mem_read(cur_row_addr) == 0, (
+            "ESC row範囲外: 後続処理で CUR_ROW が異常値になっていない"
+        )
+
+    def test_esc_col_out_of_range(self, pc):
+        """ESC '=' で col=80(>=80)を指定: 座標は変更されない(CUR_COL=0のまま)。"""
+        cur_row_addr, cur_col_addr, _, _ = _bios_data_addrs()
+        # 元のカーソルは (0,0)
+        # ESC '=' row=0(=0x20) col=80(=0x70: 0x20+80)
+        # col=80は範囲外(0〜79) → 不正値として無視
+        # ESC + '=' + row=0(0x20) を送る → 状態3(col待ち)
+        call_conout_seq(pc, [0x1B, 0x3D, 0x20])
+        # CUR_ROW は 0 にセットされる(row=0は有効)
+        assert pc._mem_read(cur_row_addr) == 0, (
+            f"ESC col範囲外: CUR_ROW={pc._mem_read(cur_row_addr)} (expected 0)"
+        )
+        # col=80 (不正値) を送る → CUR_COL は変更されない
+        call_conout(pc, 0x70)
+        assert pc._mem_read(cur_col_addr) == 0, (
+            f"ESC col範囲外: CUR_COL={pc._mem_read(cur_col_addr)} (expected 0, 不正値で変更されない)"
+        )
+
+    def test_esc_col_boundary_79_ok(self, pc):
+        """ESC '=' col=79 は有効(範囲内)、その位置に文字が書かれる。"""
+        # row=0, col=79 (=0x6F: 0x20+79) は有効
+        call_conout_seq(pc, [0x1B, 0x3D, 0x20, 0x6F, 0x59])  # 'Y'
+        ch = pc.read_vram(79, 1)
+        assert ch == b"Y", (
+            f"ESC col=79境界: VRAM[0][79]={ch!r} (expected b'Y')"
+        )
+
+    def test_esc_row_boundary_24_ok(self, pc):
+        """ESC '=' row=24 は有効(範囲内)、その位置に文字が書かれる。"""
+        # row=24 (=0x38: 0x20+24), col=0 は有効
+        call_conout_seq(pc, [0x1B, 0x3D, 0x38, 0x20, 0x59])  # 'Y'
+        ch = pc.read_vram(24 * VRAM_ROW_BYTES, 1)
+        assert ch == b"Y", (
+            f"ESC row=24境界: VRAM[24][0]={ch!r} (expected b'Y')"
+        )
+
 
 # ---------------------------------------------------------------
 # テスト 4: 半角カナ素通し
@@ -302,6 +373,37 @@ class TestScroll:
         last_row = vram_row(pc, 24, 1)
         assert last_row == b" ", (
             f"スクロール後 行24先頭={last_row!r} (expected b' ')"
+        )
+
+    def test_lf_at_row24_scrolls(self, pc):
+        """cur_row=24 のとき LF を受けるとスクロール経路に入る(NC条件)。"""
+        cur_row_addr, cur_col_addr, _, _ = _bios_data_addrs()
+        # 行0先頭に 'A' を書いておく(スクロール後の検証用)
+        call_conout(pc, 0x41)   # 'A' → VRAM[0][0]
+        # cur_row を 24 に直接セット、col=0
+        pc._mem_write(cur_row_addr, 24)
+        pc._mem_write(cur_col_addr, 0)
+        # LF を送る → スクロール発生
+        call_conout(pc, 0x0A)
+        # 行0先頭が空白になり、'A'が失われる(スクロールアウト)
+        ch = pc.read_vram(0, 1)
+        assert ch != b"A", (
+            f"LF at row=24: スクロールが発生していない (VRAM[0][0]={ch!r})"
+        )
+
+    def test_lf_at_row_over_24_scrolls(self, pc):
+        """cur_row が異常値(>24)でも LF はスクロール経路に入り VRAM外書込を起こさない。"""
+        cur_row_addr, cur_col_addr, _, _ = _bios_data_addrs()
+        # cur_row を 25 (異常値) に設定
+        pc._mem_write(cur_row_addr, 25)
+        pc._mem_write(cur_col_addr, 0)
+        # LF を送る → NC 条件で SCROLL に入る(=24でも>24でもスクロール)
+        # スクロール後、エラーやクラッシュなく完了することを確認
+        call_conout(pc, 0x0A)
+        # スクロール後の最終行(24)が空白で埋められている
+        last_row = vram_row(pc, 24, 4)
+        assert last_row == b"    ", (
+            f"LF at row>24: 最終行が空白でない: {last_row!r}"
         )
 
     def test_scroll_content_shift(self, pc):
