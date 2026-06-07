@@ -15,7 +15,7 @@ EMU_PYTHONPATH := external/z80
 
 BUILD := build
 
-.PHONY: all setup smoke clean fetch-cpm cpm check-setup check-cpm bios loader
+.PHONY: all setup smoke clean fetch-cpm cpm check-setup check-cpm bios loader cpm-image
 
 all: smoke
 
@@ -49,14 +49,16 @@ smoke: check-setup $(BUILD)/smoke.bin
 fetch-cpm:
 	./scripts/fetch_cpm.sh
 
-# 配置アドレスは #4(メモリマップ詳細設計)で確定する。
-# 以下は 44K システムの例(暫定・ビルド機構の実証用)。実値は #4 確定後に上書きする。
+# 配置アドレスは #4(メモリマップ詳細設計)で確定済み。
+#   CCP   = 0xD300〜0xDAFF (0x800バイト)
+#   BDOS  = 0xDB00〜0xE8FF (0xE00バイト, エントリは0xDB06)
+#   BIOS  = 0xE900〜0xF2FF (#6, 別ターゲット)
 # ORG を変えるときは対応する RANGE もセットで更新すること。
 CPM_SRC    := external/cpm22
-CCP_ORG    ?= 9400h
-CCP_RANGE  ?= $$9400-$$9bff
-BDOS_ORG   ?= 9c00h
-BDOS_RANGE ?= $$9c00-$$a9ff
+CCP_ORG    ?= 0D300h
+CCP_RANGE  ?= $$D300-$$DAFF
+BDOS_ORG   ?= 0DB00h
+BDOS_RANGE ?= $$DB00-$$E8FF
 
 check-cpm:
 	@test -f $(CPM_SRC)/ccp.asm || { echo "ERROR: $(CPM_SRC) がありません。先に 'make fetch-cpm' を実行してください。"; exit 1; }
@@ -96,6 +98,22 @@ $(BUILD)/loader.hex: $(BUILD)/loader.p
 
 loader: $(BUILD)/loader.bin $(BUILD)/loader.hex
 	@echo "ローダ ビルド完了 (loader.bin=$(shell wc -c < $(BUILD)/loader.bin)B, loader.hex=$(shell wc -c < $(BUILD)/loader.hex)B)"
+
+# --- CP/M システムイメージ(SD先頭16ブロック=8192B) ---
+# ローダ(#35)が SD から読み込むレイアウトに合わせて結合:
+#   LBA 0-4  (2560B): BIOS  → 0xE900 にロード
+#   LBA 5-8  (2048B): CCP   → 0xD300 にロード
+#   LBA 9-15 (3584B): BDOS  → 0xDB00 にロード
+# 計 16 ブロック × 512B = 8192B。
+$(BUILD)/cpm-image.bin: $(BUILD)/bios.bin $(BUILD)/ccp.bin $(BUILD)/bdos.bin
+	$(PY) scripts/build_cpm_image.py \
+	  --bios $(BUILD)/bios.bin \
+	  --ccp  $(BUILD)/ccp.bin \
+	  --bdos $(BUILD)/bdos.bin \
+	  --out  $@
+
+cpm-image: $(BUILD)/cpm-image.bin
+	@echo "CP/M システムイメージ ビルド完了 (cpm-image.bin=$(shell wc -c < $(BUILD)/cpm-image.bin)B)"
 
 clean:
 	rm -rf $(BUILD)
