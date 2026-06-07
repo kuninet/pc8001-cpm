@@ -15,11 +15,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from emu.pc8001 import PC8001, VRAM_BASE, VRAM_ROW_BYTES
 from bios_syms import sym
+import memmap
 
 # ---------------------------------------------------------------
-# BIOS 定数
+# BIOS 定数(配置は tests/memmap.py で BIOS_BLOCKS から導出)
 # ---------------------------------------------------------------
-BIOS_ORG  = 0xE900
+BIOS_ORG  = memmap.BIOS_ADDR
+CCP_ADDR  = memmap.CCP_ADDR
 BIOS_BIN  = os.path.join(PROJECT_ROOT, "build", "bios.bin")
 BIOS_SRC  = os.path.join(PROJECT_ROOT, "src", "bios", "bios.asm")
 BUILD_DIR = os.path.join(PROJECT_ROOT, "build")
@@ -29,8 +31,7 @@ CONST_VEC  = BIOS_ORG + 2 * 3   # vec(2) = CONST
 CONIN_VEC  = BIOS_ORG + 3 * 3   # vec(3) = CONIN
 
 
-def vec(n: int) -> int:
-    return BIOS_ORG + 3 * n
+vec = memmap.vec
 
 
 # ---------------------------------------------------------------
@@ -41,7 +42,7 @@ def _build_bios() -> None:
     os.makedirs(BUILD_DIR, exist_ok=True)
     p_file = os.path.join(BUILD_DIR, "bios.p")
     result = subprocess.run(
-        ["asl", "-D", "origin=0E900h", "-o", p_file, BIOS_SRC],
+        ["asl", *memmap.bios_asl_defines(), "-o", p_file, BIOS_SRC],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -130,8 +131,8 @@ class TestBoot:
         """BOOT後: VRAM の全行が空白(0x20)またはサインオン文字。"""
         instance = PC8001()
         _load_bios(instance)
-        # BOOT は最後に JP 0xD300(CCP) へジャンプするので、0xD300 に HALT を置く
-        instance.load(0xD300, bytes([0x76]))
+        # BOOT は最後に JP CCP_ORG(CCP) へジャンプするので、CCP_ORG に HALT を置く
+        instance.load(CCP_ADDR, bytes([0x76]))
         instance.set_pc(BIOS_ORG)
         instance.run_until_halt(max_steps=500000)
 
@@ -142,20 +143,78 @@ class TestBoot:
             f"BOOT: 行0={first_row[:len(signon)]!r} != {signon!r}"
         )
 
-    def test_attr_cleared_on_boot(self):
-        """BOOT後: 全行のアトリビュート40バイトが 0x00。"""
+    def test_attr_initialized_on_boot(self):
+        """BOOT後: 全行のアトリビュート40バイトが既定属性テンプレート。
+        doc/アトリビュート.md: 各行 00h,0E8h(距離0・白キャラクタ) + [50h,00h]×19。
+        """
         instance = PC8001()
         _load_bios(instance)
-        # BOOT は最後に JP 0xD300(CCP) へジャンプするので、0xD300 に HALT を置く
-        instance.load(0xD300, bytes([0x76]))
+        # BOOT は最後に JP CCP_ORG(CCP) へジャンプするので、CCP_ORG に HALT を置く
+        instance.load(CCP_ADDR, bytes([0x76]))
         instance.set_pc(BIOS_ORG)
         instance.run_until_halt(max_steps=500000)
 
+        # 期待テンプレート: [0x00,0xE8] + [0x50,0x00]×19 = 40バイト
+        expected = bytes([0x00, 0xE8]) + bytes([0x50, 0x00] * 19)
+        assert len(expected) == 40
         for row in range(25):
             attr = instance.read_vram(row * VRAM_ROW_BYTES + 80, 40)
-            assert attr == bytes(40), (
-                f"BOOT: 行{row} アトリビュートが 0x00 でない: {attr!r}"
+            assert attr == expected, (
+                f"BOOT: 行{row} アトリビュート={attr!r} != 既定 {expected!r}"
             )
+
+
+# ---------------------------------------------------------------
+# テスト: CRTC(μPD3301)+ DMA(μPD8257) 初期化シーケンス
+#   doc/CRTC初期化.md の送出順・値の回帰防止。
+#   実表示はエミュレータでは再現しないが、OUT は受理・記録される。
+# ---------------------------------------------------------------
+
+class TestCrtcInit:
+    """BOOT 時の CRTC/DMA 初期化バイト列を検証する。"""
+
+    def _boot(self):
+        instance = PC8001()
+        _load_bios(instance)
+        instance.load(CCP_ADDR, bytes([0x76]))  # CCP に HALT
+        instance.set_pc(BIOS_ORG)
+        instance.run_until_halt(max_steps=500000)
+        return instance
+
+    def test_crtc_command_sequence(self):
+        """ポート0x51(CRTCコマンド): RESET→OCW3→OCW2 = [0x00, 0x43, 0x20]。"""
+        inst = self._boot()
+        assert inst.crtc_cmd == [0x00, 0x43, 0x20], (
+            f"CRTCコマンド列={inst.crtc_cmd} (expected [0x00, 0x43, 0x20])"
+        )
+
+    def test_crtc_format_sequence(self):
+        """ポート0x50(SCREEN FORMAT1-5) = [0x4E, 0x18, 0x67, 0xDE, 0x53]。"""
+        inst = self._boot()
+        assert inst.crtc_param == [0x4E, 0x18, 0x67, 0xDE, 0x53], (
+            f"CRTC FORMAT列={inst.crtc_param} "
+            f"(expected [0x4E, 0x18, 0x67, 0xDE, 0x53])"
+        )
+
+    def test_dma_sequence(self):
+        """μPD8257 DMA(Ch2)送出列 (ポート,値) の順序と値。"""
+        inst = self._boot()
+        expected = [
+            (0x64, 0x00), (0x64, 0xF3),   # DMAアドレス 0xF300
+            (0x65, 0xB7), (0x65, 0x4B),   # カウント2999 + リードサイクル
+            (0x68, 0x84),                 # オートロード + Ch2有効
+        ]
+        assert inst.dma_log == expected, (
+            f"DMA送出列={[(hex(p), hex(v)) for p, v in inst.dma_log]} "
+            f"(expected {[(hex(p), hex(v)) for p, v in expected]})"
+        )
+
+    def test_display_enable_port40(self):
+        """ポート0x40: 表示有効化(d3=0)。スタブ値 0x00。"""
+        inst = self._boot()
+        assert inst.port40 == 0x00, (
+            f"port40=0x{inst.port40:02X} (expected 0x00, d3=0 表示有効)"
+        )
 
 
 # ---------------------------------------------------------------
@@ -465,23 +524,23 @@ class TestConstConin:
         assert a == 0x00, f"CONST(キーなし): A=0x{a:02X} (expected 0x00)"
 
     def test_const_key_pressed(self, pc):
-        """'A'キー位置(行4,列1)を押すと CONST が 0xFF を返す。
-        ダミーマッピング: 0x41 = 0x20 + 4*8 + 1 → 行4, 列1
+        """'A'キー位置(ポート02h D1)を押すと CONST が 0xFF を返す。
+        doc/キーボードマトリクス.md: 'A' = 02h D1 → set_key_matrix(2, 1)。
         """
         pc.clear_keys()
-        pc.set_key_matrix(4, 1, True)
+        pc.set_key_matrix(2, 1, True)
         a = self._call_const(pc)
         pc.clear_keys()
         assert a == 0xFF, f"CONST(キーあり): A=0x{a:02X} (expected 0xFF)"
 
     def test_conin_returns_key(self, pc):
-        """'A'キー位置(行4,列1)を押して CONIN → A==0x41('A')。"""
+        """'A'キー位置(02h D1)を押して CONIN → A==0x41('A')。"""
         pc.clear_keys()
         # KEYBUFが残っているかもしれないのでリセット
         # KEYBUF を直接クリアするためにキーなしでCONSTを一度呼ぶ
         a = self._call_const(pc)
 
-        pc.set_key_matrix(4, 1, True)
+        pc.set_key_matrix(2, 1, True)
         a = self._call_conin(pc)
         pc.clear_keys()
         assert a == 0x41, f"CONIN('A'): A=0x{a:02X} (expected 0x41)"
@@ -489,7 +548,7 @@ class TestConstConin:
     def test_conin_clears_buffer(self, pc):
         """CONIN後にCONSTを呼ぶとバッファが空(0x00)になる。"""
         pc.clear_keys()
-        pc.set_key_matrix(4, 1, True)
+        pc.set_key_matrix(2, 1, True)   # 'A' = 02h D1
         self._call_conin(pc)
         pc.clear_keys()
 
@@ -497,21 +556,46 @@ class TestConstConin:
         a = self._call_const(pc)
         assert a == 0x00, f"CONIN後CONST: A=0x{a:02X} (expected 0x00)"
 
-    def test_conin_ctrl_key(self, pc):
-        """CTRL+'A': 行0 bit7=0(CTRL), 行4 bit1=0('A') → CONIN = 0x01(Ctrl-A)。"""
+    def test_conin_return_key(self, pc):
+        """RETURN(01h D7) → CONIN = 0x0D(CR)。"""
         pc.clear_keys()
-        # 行0 bit7=0 → CTRL押下
-        pc.set_key_matrix(0, 7, True)
-        # 行4 bit1=0 → 'A'キー
-        pc.set_key_matrix(4, 1, True)
+        pc.set_key_matrix(1, 7, True)   # RETURN = 01h D7
+        a = self._call_conin(pc)
+        pc.clear_keys()
+        assert a == 0x0D, f"CONIN(RETURN): A=0x{a:02X} (expected 0x0D)"
+
+    def test_conin_esc_key(self, pc):
+        """ESC(09h D7) → CONIN = 0x1B。"""
+        pc.clear_keys()
+        pc.set_key_matrix(9, 7, True)   # ESC = 09h D7
+        a = self._call_conin(pc)
+        pc.clear_keys()
+        assert a == 0x1B, f"CONIN(ESC): A=0x{a:02X} (expected 0x1B)"
+
+    def test_conin_ctrl_key(self, pc):
+        """CTRL+'A': CTRL=08h D7, 'A'=02h D1 → CONIN = 0x01(Ctrl-A)。"""
+        pc.clear_keys()
+        pc.set_key_matrix(8, 7, True)   # CTRL = 08h D7
+        pc.set_key_matrix(2, 1, True)   # 'A' = 02h D1
         a = self._call_conin(pc)
         pc.clear_keys()
         assert a == 0x01, f"CONIN(Ctrl+A): A=0x{a:02X} (expected 0x01)"
 
-    def test_conin_space(self, pc):
-        """スペース(0x20)キー: 行0, 列0 → ASCII=0x20。"""
+    def test_conin_shift_letter_lowercase(self, pc):
+        """SHIFT+'A': SHIFT=08h D6, 'A'=02h D1 → CONIN = 0x61('a')。
+        基本テーブルは大文字、SHIFT で小文字へトグルする。
+        """
         pc.clear_keys()
-        pc.set_key_matrix(0, 0, True)
+        pc.set_key_matrix(8, 6, True)   # SHIFT = 08h D6
+        pc.set_key_matrix(2, 1, True)   # 'A' = 02h D1
+        a = self._call_conin(pc)
+        pc.clear_keys()
+        assert a == 0x61, f"CONIN(Shift+A): A=0x{a:02X} (expected 0x61='a')"
+
+    def test_conin_space(self, pc):
+        """スペース(09h D6) → ASCII=0x20。"""
+        pc.clear_keys()
+        pc.set_key_matrix(9, 6, True)   # SPACE = 09h D6
         a = self._call_conin(pc)
         pc.clear_keys()
         assert a == 0x20, f"CONIN(space): A=0x{a:02X} (expected 0x20)"

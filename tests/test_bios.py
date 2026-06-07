@@ -8,23 +8,25 @@ import subprocess
 import sys
 import pytest
 
-# プロジェクトルートをパスに追加
+# プロジェクトルート + tests ディレクトリをパスに追加
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from emu.pc8001 import PC8001
+import memmap
 
 # ---------------------------------------------------------------
-# BIOS 定数
+# BIOS 定数(配置は tests/memmap.py で BIOS_BLOCKS から導出)
 # ---------------------------------------------------------------
-BIOS_ORG = 0xE900
+BIOS_ORG = memmap.BIOS_ADDR
+CCP_ADDR = memmap.CCP_ADDR
 BIOS_BIN  = os.path.join(PROJECT_ROOT, "build", "bios.bin")
 BIOS_SRC  = os.path.join(PROJECT_ROOT, "src", "bios", "bios.asm")
 BUILD_DIR = os.path.join(PROJECT_ROOT, "build")
 
 # ベクタアドレス: vec(n) = BIOS_ORG + 3*n
-def vec(n: int) -> int:
-    return BIOS_ORG + 3 * n
+vec = memmap.vec
 
 
 # ---------------------------------------------------------------
@@ -38,9 +40,9 @@ def _build_bios() -> None:
     p_file = os.path.join(BUILD_DIR, "bios.p")
     bin_file = BIOS_BIN
 
-    # アセンブル
+    # アセンブル(配置は memmap から導出した -D を渡す)
     result = subprocess.run(
-        ["asl", "-D", "origin=0E900h", "-o", p_file, BIOS_SRC],
+        ["asl", *memmap.bios_asl_defines(), "-o", p_file, BIOS_SRC],
         capture_output=True,
         text=True,
     )
@@ -106,9 +108,9 @@ class TestJumpTable:
     def test_jp_targets_in_bios_range(self, pc_with_bios):
         """各 JP のオペランド(続く2バイト, LE)が BIOS範囲内の妥当アドレスを指す。"""
         pc = pc_with_bios
-        # 本体コードはジャンプテーブル直後(0xE933)〜上端 0xF2FF の範囲に収まる。
-        code_start = BIOS_ORG + 17 * 3   # 0xE933
-        code_end = 0xF2FF
+        # 本体コードはジャンプテーブル直後(origin+0x33)〜上端 0xF2FF の範囲に収まる。
+        code_start = BIOS_ORG + 17 * 3   # origin+0x33
+        code_end = memmap.BIOS_END       # 0xF2FF
         for n in range(17):
             addr = vec(n)
             lo = pc._mem_read(addr + 1)
@@ -132,9 +134,15 @@ class TestJumpTable:
         for n in range(17):
             off = n * 3
             expected[n] = data[off + 1] | (data[off + 2] << 8)
-        # 設計上の固定値(順序ロック)
-        assert expected[0] == 0xE933, f"BOOT(vec0) JP 先 0x{expected[0]:04X} != 0xE933"
-        assert expected[1] == 0xE945, f"WBOOT(vec1) JP 先 0x{expected[1]:04X} != 0xE945"
+        # 設計上の固定オフセット(順序ロック): BOOT=origin+0x33, WBOOT=origin+0x45
+        boot_expected = BIOS_ORG + 0x33
+        wboot_expected = BIOS_ORG + 0x45
+        assert expected[0] == boot_expected, (
+            f"BOOT(vec0) JP 先 0x{expected[0]:04X} != 0x{boot_expected:04X}"
+        )
+        assert expected[1] == wboot_expected, (
+            f"WBOOT(vec1) JP 先 0x{expected[1]:04X} != 0x{wboot_expected:04X}"
+        )
         # ロード済みメモリの値とビルド結果が一致すること
         for n in range(17):
             addr = vec(n)
@@ -151,16 +159,17 @@ class TestJumpTable:
 # ---------------------------------------------------------------
 
 class TestSectran:
-    """SECTRAN(vec16=0xE930): BC をそのまま HL に返す。"""
+    """SECTRAN(vec16): BC をそのまま HL に返す。"""
 
     def test_identity_conversion(self, pc_with_bios):
         """LD BC,0x1234 → CALL SECTRAN → HL==0x1234。"""
         pc = pc_with_bios
         # テストスタブをバンク0 RAM (0x8000) に配置
-        # 01 34 12  LD BC, 0x1234
-        # CD 30 E9  CALL 0xE930  (vec(16) = SECTRAN)
-        # 76        HALT
-        prog = bytes([0x01, 0x34, 0x12, 0xCD, 0x30, 0xE9, 0x76])
+        # vec(16) = BIOS_ORG + 3*16 (SECTRAN)
+        sectran_addr = vec(16)
+        lo = sectran_addr & 0xFF
+        hi = (sectran_addr >> 8) & 0xFF
+        prog = bytes([0x01, 0x34, 0x12, 0xCD, lo, hi, 0x76])
         pc.load(0x8000, prog)
         pc.load(0x8100, bytes([0x00] * 0x10))  # スタック領域を確保
         pc.cpu.sp = 0x8110
@@ -177,14 +186,16 @@ class TestSectran:
 # ---------------------------------------------------------------
 
 class TestListst:
-    """LISTST(vec15=0xE92D): A=0xFF を返す。"""
+    """LISTST(vec15): A=0xFF を返す。"""
 
     def test_returns_0xff(self, pc_with_bios):
         """CALL LISTST → A==0xFF。"""
         pc = pc_with_bios
-        # CD 2D E9  CALL 0xE92D  (vec(15) = LISTST)
-        # 76        HALT
-        prog = bytes([0xCD, 0x2D, 0xE9, 0x76])
+        # vec(15) = BIOS_ORG + 3*15
+        listst_addr = vec(15)
+        lo = listst_addr & 0xFF
+        hi = (listst_addr >> 8) & 0xFF
+        prog = bytes([0xCD, lo, hi, 0x76])
         pc.load(0x8000, prog)
         pc.cpu.sp = 0x8110
         pc.set_pc(0x8000)
@@ -200,14 +211,16 @@ class TestListst:
 # ---------------------------------------------------------------
 
 class TestConst:
-    """CONST(vec2=0xE906): A=0 を返す。"""
+    """CONST(vec2): A=0 を返す。"""
 
     def test_returns_0(self, pc_with_bios):
         """CALL CONST → A==0。"""
         pc = pc_with_bios
-        # CD 06 E9  CALL 0xE906  (vec(2) = CONST)
-        # 76        HALT
-        prog = bytes([0xCD, 0x06, 0xE9, 0x76])
+        # vec(2) = BIOS_ORG + 3*2
+        const_addr = vec(2)
+        lo = const_addr & 0xFF
+        hi = (const_addr >> 8) & 0xFF
+        prog = bytes([0xCD, lo, hi, 0x76])
         pc.load(0x8000, prog)
         pc.cpu.sp = 0x8110
         pc.set_pc(0x8000)
@@ -223,15 +236,17 @@ class TestConst:
 # ---------------------------------------------------------------
 
 class TestConout:
-    """CONOUT(vec4=0xE90C): C の文字を VRAM カーソル位置へ書く。"""
+    """CONOUT(vec4): C の文字を VRAM カーソル位置へ書く。"""
 
     def test_single_char_a(self, pc_with_bios):
         """LD C,'A' → CALL CONOUT → VRAM[0]=='A'(0x41)。"""
         pc = pc_with_bios
-        # 0E 41     LD C, 0x41 ('A')
-        # CD 0C E9  CALL 0xE90C  (vec(4) = CONOUT)
-        # 76        HALT
-        prog = bytes([0x0E, 0x41, 0xCD, 0x0C, 0xE9, 0x76])
+        # vec(4) = BIOS_ORG + 3*4
+        conout_addr = vec(4)
+        lo = conout_addr & 0xFF
+        hi = (conout_addr >> 8) & 0xFF
+        # 0E 41  LD C, 0x41 ('A'); CD lo hi  CALL CONOUT; 76  HALT
+        prog = bytes([0x0E, 0x41, 0xCD, lo, hi, 0x76])
         pc.load(0x8000, prog)
         pc.cpu.sp = 0x8110
         pc.set_pc(0x8000)
@@ -244,14 +259,12 @@ class TestConout:
     def test_two_chars_ab(self, pc_with_bios):
         """'A'→'B'の順に出力すると VRAM[0:2]==b'AB'。"""
         pc = pc_with_bios
-        # 0E 41     LD C, 'A'
-        # CD 0C E9  CALL CONOUT
-        # 0E 42     LD C, 'B'
-        # CD 0C E9  CALL CONOUT
-        # 76        HALT
+        conout_addr = vec(4)
+        lo = conout_addr & 0xFF
+        hi = (conout_addr >> 8) & 0xFF
         prog = bytes([
-            0x0E, 0x41, 0xCD, 0x0C, 0xE9,
-            0x0E, 0x42, 0xCD, 0x0C, 0xE9,
+            0x0E, 0x41, 0xCD, lo, hi,
+            0x0E, 0x42, 0xCD, lo, hi,
             0x76,
         ])
         pc.load(0x8000, prog)
@@ -266,16 +279,19 @@ class TestConout:
     def test_preserves_registers(self, pc_with_bios):
         """CONOUT 呼出し前後で BC/DE/HL が不変(特に BC は CP/M 規約)。"""
         pc = pc_with_bios
+        conout_addr = vec(4)
+        lo = conout_addr & 0xFF
+        hi = (conout_addr >> 8) & 0xFF
         # 01 42 00  LD BC, 0x0042  (C='B', B=0x00)
         # 11 34 12  LD DE, 0x1234
         # 21 78 56  LD HL, 0x5678
-        # CD 0C E9  CALL 0xE90C  (vec(4) = CONOUT)
+        # CD lo hi  CALL CONOUT (vec(4))
         # 76        HALT
         prog = bytes([
             0x01, 0x42, 0x00,
             0x11, 0x34, 0x12,
             0x21, 0x78, 0x56,
-            0xCD, 0x0C, 0xE9,
+            0xCD, lo, hi,
             0x76,
         ])
         pc.load(0x8000, prog)
@@ -310,44 +326,42 @@ class TestDummyRoutines:
         assert result is True, "HALT に到達しなかった"
 
     def test_conin_with_key(self, pc_with_bios):
-        """CONIN(vec3=0xE909): キー押下済みなら A==押下文字。
-        ダミーマッピング: ASCII 0x41('A')は行2列1 → 行0x41=0x20+2*8+1=0x31? ... 確認。
-        0x20 + row*8 + col = 0x41 → row*8+col = 0x21=33 → row=4,col=1
+        """CONIN(vec3): キー押下済みなら A==押下文字。
+        doc/キーボードマトリクス.md: 'A' = ポート02h D1 → set_key_matrix(2, 1)。
         """
         pc = pc_with_bios
-        # 0x41 = 0x20 + 4*8 + 1: 行4, 列1 にキーを押す
-        pc.set_key_matrix(4, 1, True)
+        pc.set_key_matrix(2, 1, True)   # 'A' = 02h D1
         self._call_and_halt(pc, vec(3))
         pc.clear_keys()
         assert pc.cpu.a == 0x41, f"CONIN: A=0x{pc.cpu.a:02X} (expected 0x41='A')"
 
     def test_reader_returns_eof(self, pc_with_bios):
-        """READER(vec7=0xE915): A==0x1A(EOF)。"""
+        """READER(vec7): A==0x1A(EOF)。"""
         pc = pc_with_bios
         self._call_and_halt(pc, vec(7))
         assert pc.cpu.a == 0x1A, f"READER: A=0x{pc.cpu.a:02X} (expected 0x1A)"
 
     def test_read_returns_error(self, pc_with_bios):
-        """READ(vec13=0xE927): A==1(エラー)。"""
+        """READ(vec13): A==1(エラー)。"""
         pc = pc_with_bios
         self._call_and_halt(pc, vec(13))
         assert pc.cpu.a == 1, f"READ: A=0x{pc.cpu.a:02X} (expected 0x01)"
 
     def test_write_returns_error(self, pc_with_bios):
-        """WRITE(vec14=0xE92A): A==1(エラー)。"""
+        """WRITE(vec14): A==1(エラー)。"""
         pc = pc_with_bios
         self._call_and_halt(pc, vec(14))
         assert pc.cpu.a == 1, f"WRITE: A=0x{pc.cpu.a:02X} (expected 0x01)"
 
     def test_seldsk_valid_drive(self, pc_with_bios):
-        """SELDSK(vec9=0xE91B): C=0 で HL != 0 (DPH アドレスを返す)。"""
+        """SELDSK(vec9): C=0 で HL != 0 (DPH アドレスを返す)。"""
         pc = pc_with_bios
         # 0E 00  LD C, 0  → CALL SELDSK
         self._call_and_halt(pc, vec(9), prefix=bytes([0x0E, 0x00]))
         assert pc.cpu.hl != 0, f"SELDSK: HL=0x{pc.cpu.hl:04X} (expected non-zero DPH addr)"
 
     def test_seldsk_invalid_drive(self, pc_with_bios):
-        """SELDSK(vec9=0xE91B): C=8(範囲外) で HL==0(無効)。"""
+        """SELDSK(vec9): C=8(範囲外) で HL==0(無効)。"""
         pc = pc_with_bios
         # 0E 08  LD C, 8  → CALL SELDSK
         self._call_and_halt(pc, vec(9), prefix=bytes([0x0E, 0x08]))
@@ -359,14 +373,14 @@ class TestDummyRoutines:
 # ---------------------------------------------------------------
 
 class TestBoot:
-    """BOOT(vec0=0xE900): 実行後 screen_text の1行目が 'PC-8001 CP/M 2.2 BIOS' で始まる。"""
+    """BOOT(vec0=BIOS_ORG): 実行後 screen_text の1行目が 'PC-8001 CP/M 2.2 BIOS' で始まる。"""
 
     def test_signon_message(self):
-        """pc=0xE900 で run_until_halt → 1行目が 'PC-8001 CP/M 2.2 BIOS' で始まる。"""
+        """pc=BIOS_ORG で run_until_halt → 1行目が 'PC-8001 CP/M 2.2 BIOS' で始まる。"""
         pc = PC8001()
         _load_bios(pc)
-        # BOOT は最後に JP 0xD300(CCP) へジャンプするので、0xD300 に HALT を置く
-        pc.load(0xD300, bytes([0x76]))
+        # BOOT は最後に JP CCP_ORG(CCP) へジャンプするので、CCP_ORG に HALT を置く
+        pc.load(CCP_ADDR, bytes([0x76]))
         # BOOT はスタックを DF00h に設定するので SP 設定は不要
         pc.set_pc(BIOS_ORG)
         result = pc.run_until_halt(max_steps=200000)

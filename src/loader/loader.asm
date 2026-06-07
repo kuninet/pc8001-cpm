@@ -5,18 +5,22 @@
 ;   配置: 拡張ROM 0x6000-0x7FFF (8KB)
 ;   org 0x6000 で ROM 全体を配置する。
 ;
-;   ブートフロー:
+;   配置アドレス・LBAは Makefile から -D で受領する(数値直書きを排除):
+;     BIOS_ORG, CCP_ORG, BDOS_ORG, BIOS_BLOCKS, CCP_LBA, BDOS_LBA
+;   メモリ配置は単一パラメータ BIOS_BLOCKS から導出される。
+;
+;   ブートフロー(例 BIOS_BLOCKS=9):
 ;     1. 0x6000(ROM): E2 bit4=1 → 拡張RAM書込許可
 ;     2. SD初期化(自前SDドライバ内蔵)
 ;     3. SDからCP/M本体読込:
-;          BIOS  LBA 0-4  (5ブロック=2560B) → 0xE900
-;          CCP   LBA 5-8  (4ブロック=2048B) → 0xD300
-;          BDOS  LBA 9-15 (7ブロック=3584B) → 0xDB00
+;          BIOS  LBA 0-8  (9ブロック=4608B) → 0xE100
+;          CCP   LBA 9-12 (4ブロック=2048B) → 0xCB00
+;          BDOS  LBA 13-19(7ブロック=3584B) → 0xD300
 ;     4. ゼロページ初期化
-;        0x0000: JP 0xE903(WBOOT)
-;        0x0005: JP 0xDB06(BDOSエントリ)
-;     5. ROM切替コード(7バイト)を 0x8200 へコピー
-;     6. JP 0x8200 → OUT(E2),0x11; JP 0xE900
+;        0x0000: JP (BIOS_ORG+3)  (WBOOT)
+;        0x0005: JP (BDOS_ORG+6)  (BDOSエントリ)
+;     5. ROM切替コードを 0x8200 へコピー
+;     6. JP 0x8200 → OUT(E2),0x11; JP BIOS_ORG
 ;
 ;   SDドライバはBIOS実装(#33)の独立コピー。
 ;   8255 ポート割当(SD-DOS互換):
@@ -39,17 +43,35 @@ E2_PORT		equ	0E2h
 E2_WE		equ	10h		; bit4=1: 拡張RAM書込許可
 E2_HIDE_ROM	equ	11h		; bit0=1 + bit4=1: ROM隠蔽
 
-; CP/M 配置アドレス
-BIOS_ADDR	equ	0E900h
-CCP_ADDR	equ	0D300h
-BDOS_ADDR	equ	0DB00h
+; CP/M 配置アドレス(-D 未指定時のデフォルト = BIOS_BLOCKS=9 相当)
+	ifndef	BIOS_ORG
+BIOS_ORG	equ	0E100h
+	endif
+	ifndef	CCP_ORG
+CCP_ORG	equ	0CB00h
+	endif
+	ifndef	BDOS_ORG
+BDOS_ORG	equ	0D300h
+	endif
+	ifndef	BIOS_BLOCKS
+BIOS_BLOCKS	equ	9
+	endif
+	ifndef	CCP_LBA
+CCP_LBA	equ	9
+	endif
+	ifndef	BDOS_LBA
+BDOS_LBA	equ	13
+	endif
 
-; LBAレイアウト(設計02 §3)
+BIOS_ADDR	equ	BIOS_ORG
+CCP_ADDR	equ	CCP_ORG
+BDOS_ADDR	equ	BDOS_ORG
+
+; LBAレイアウト(BIOS_BLOCKS から導出)
 BIOS_LBA_START	equ	0
-BIOS_BLOCKS	equ	5		; 5 × 512 = 2560B
-CCP_LBA_START	equ	5
+CCP_LBA_START	equ	CCP_LBA
 CCP_BLOCKS	equ	4		; 4 × 512 = 2048B
-BDOS_LBA_START	equ	9
+BDOS_LBA_START	equ	BDOS_LBA
 BDOS_BLOCKS	equ	7		; 7 × 512 = 3584B
 
 ; RAM上の一時バッファ(本体RAM 0x8000以上)
@@ -85,45 +107,45 @@ LOADER_START:
 	CALL	LD_SD_INIT
 	JR	C, LOADER_HANG		; 失敗: 停止
 
-	; BIOSをSDから読込 → 0xE900
+	; BIOSをSDから読込 → BIOS_ORG
 	LD	HL, BIOS_ADDR		; 書込先アドレス
 	LD	DE, BIOS_LBA_START	; 開始LBA(上位=D=0, 下位=E=0)
 	LD	B, BIOS_BLOCKS		; ブロック数
 	CALL	LD_READ_BLOCKS
 	JR	C, LOADER_HANG
 
-	; CCPをSDから読込 → 0xD300
+	; CCPをSDから読込 → CCP_ORG
 	LD	HL, CCP_ADDR
-	LD	DE, CCP_LBA_START	; E=5
+	LD	DE, CCP_LBA_START
 	LD	B, CCP_BLOCKS
 	CALL	LD_READ_BLOCKS
 	JR	C, LOADER_HANG
 
-	; BDOSをSDから読込 → 0xDB00
+	; BDOSをSDから読込 → BDOS_ORG
 	LD	HL, BDOS_ADDR
-	LD	DE, BDOS_LBA_START	; E=9
+	LD	DE, BDOS_LBA_START
 	LD	B, BDOS_BLOCKS
 	CALL	LD_READ_BLOCKS
 	JR	C, LOADER_HANG
 
 	; ゼロページ初期化(E2 bit4=1 で書込可能)
-	; 0x0000-0x0002: JP 0xE903 (WBOOT)
+	; 0x0000-0x0002: JP (BIOS_ORG+3) (WBOOT)
 	LD	HL, 0000h
-	LD	(HL), 0C3h		; JP
+	LD	(HL), 0C3h			; JP
 	INC	HL
-	LD	(HL), 03h		; 0xE903 低バイト
+	LD	(HL), (BIOS_ORG+3)&0FFh		; WBOOT 低バイト
 	INC	HL
-	LD	(HL), 0E9h		; 0xE903 高バイト
-	; 0x0005-0x0007: JP 0xDB06 (BDOSエントリ)
+	LD	(HL), ((BIOS_ORG+3)>>8)&0FFh	; WBOOT 高バイト
+	; 0x0005-0x0007: JP (BDOS_ORG+6) (BDOSエントリ)
 	LD	HL, 0005h
-	LD	(HL), 0C3h		; JP
+	LD	(HL), 0C3h			; JP
 	INC	HL
-	LD	(HL), 06h		; 0xDB06 低バイト
+	LD	(HL), (BDOS_ORG+6)&0FFh		; BDOSエントリ 低バイト
 	INC	HL
-	LD	(HL), 0DBh		; 0xDB06 高バイト
+	LD	(HL), ((BDOS_ORG+6)>>8)&0FFh	; BDOSエントリ 高バイト
 
 	; ROM切替コードを本体RAM(0x8200)へコピー
-	; コード: OUT (E2),0x11; JP 0xE900 = 8バイト
+	; コード: OUT (E2),0x11; JP BIOS_ORG
 	LD	HL, LD_SWITCH_CODE	; コピー元(ROM上)
 	LD	DE, LD_SWITCH		; コピー先(本体RAM 0x8200)
 	LD	BC, LD_SWITCH_SIZE
@@ -143,7 +165,7 @@ LOADER_HANG:
 LD_SWITCH_CODE:
 	LD	A, E2_HIDE_ROM		; 0x11: ROM隠蔽 + 書込許可
 	OUT	(E2_PORT), A		; OUT (0xE2), 0x11
-	JP	BIOS_ADDR		; JP 0xE900
+	JP	BIOS_ADDR		; JP BIOS_ORG
 LD_SWITCH_END:
 LD_SWITCH_SIZE	equ	LD_SWITCH_END - LD_SWITCH_CODE
 

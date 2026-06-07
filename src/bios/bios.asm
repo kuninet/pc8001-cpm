@@ -1,19 +1,40 @@
 ;==============================================================
 ; PC-8001 CP/M 2.2 BIOS
 ; doc/設計/03_BIOS構成.md, doc/設計/04_コンソール.md 準拠
-;   - BIOS_ORG = 0E900h
+;   - 配置/CCP/BDOSアドレス・LBAはすべて Makefile から -D で受領する
+;     (origin=BIOS_ORG, CCP_ORG, BDOS_ORG, CCP_LBA, BDOS_LBA)。
+;   - 数値直書きを排除し、メモリ配置は BIOS_BLOCKS の単一パラメータから導出。
 ;   - ジャンプテーブル: 17エントリ × 3バイト = 51バイト
-;   - コンソール: テキストVRAM 0F300h, ADM-3A相当
+;   - コンソール: テキストVRAM 0F300h(固定), ADM-3A相当
 ;
-; ビルド:
-;   asl -D origin=0E900h -o build/bios.p src/bios/bios.asm
-;   p2bin build/bios.p build/bios.bin
+; ビルド(例 BIOS_BLOCKS=9):
+;   asl -D origin=0E100h -D CCP_ORG=0CB00h -D BDOS_ORG=0D300h \
+;       -D CCP_LBA=9 -D BDOS_LBA=13 -o build/bios.p src/bios/bios.asm
+;   p2bin build/bios.p build/bios.bin -r '$E100-$F2FF'
 ;==============================================================
 	cpu	z80
 
+; --- 配置パラメータ(未指定時のデフォルト = BIOS_BLOCKS=9 相当)---
 	ifndef	origin
-origin	equ	0E900h
+origin	equ	0E100h
 	endif
+	ifndef	CCP_ORG
+CCP_ORG	equ	0CB00h
+	endif
+	ifndef	BDOS_ORG
+BDOS_ORG	equ	0D300h
+	endif
+	ifndef	CCP_LBA
+CCP_LBA	equ	9
+	endif
+	ifndef	BDOS_LBA
+BDOS_LBA	equ	13
+	endif
+
+; BIOS専用スタック。テキストVRAM(0xF300-0xFEB7)の上の空き領域に置く。
+;   CLS が VRAM全域(0xF300-0xFEB7)をクリアするため、スタックはその上(0xFF00)に
+;   退避する。CCP/BDOS/BIOS本体のいずれも破壊しない安全領域。
+BIOS_STACK	equ	0FF00h
 
 	org	origin
 
@@ -40,49 +61,46 @@ origin	equ	0E900h
 	JP	SECTRAN		; 16: SECTRAN 論理→物理セクタ変換
 
 ;--------------------------------------------------------------
-; BOOT: コールドブート (0E933h 固定)
-;   スタックポインタ設定 → CRTC初期化 → VRAMクリア → サインオン → HALT
-;   TODO: 実機ではCCPへ #35/#37
+; BOOT: コールドブート (origin+0x33 固定)
+;   スタックポインタ設定 → CRTC初期化 → VRAMクリア → サインオン → CCPへ
 ;   ※ BOOT本体は WBOOT の後(BOOT_BODY)に配置
-;      ジャンプテーブル直後のアドレス制約(0xE933/0xE945)を守るため
+;      ジャンプテーブル直後のアドレス制約(origin+0x33 / origin+0x45)を守るため
+;   スタックは VRAM領域(BIOS_STACK)を使う。実機ではBOOT時点でCCP/BDOSが
+;   ロード済みのため、それらを破壊しない VRAM領域に退避する。
 ;--------------------------------------------------------------
-BOOT:					; == 0E933h ==
-	LD	SP, 0DF00h		; スタックポインタ設定 (3B: 0xE933-0xE935)
-	JP	BOOT_BODY		; BOOT本体へ (3B: 0xE936-0xE938)
-	NOP				; パディング (1B: 0xE939)
-	NOP				; パディング (1B: 0xE93A)
-	NOP				; パディング (1B: 0xE93B)
-	NOP				; パディング (1B: 0xE93C)
-	NOP				; パディング (1B: 0xE93D)
-	NOP				; パディング (1B: 0xE93E)
-	NOP				; パディング (1B: 0xE93F)
-	NOP				; パディング (1B: 0xE940)
-	NOP				; パディング (1B: 0xE941)
-	NOP				; パディング (1B: 0xE942)
-	NOP				; パディング (1B: 0xE943)
-	NOP				; パディング (1B: 0xE944)
+BOOT:					; == origin+0x33 ==
+	LD	SP, BIOS_STACK		; スタックポインタ設定 (3B: origin+0x33..0x35)
+	JP	BOOT_BODY		; BOOT本体へ (3B: origin+0x36..0x38)
+	NOP				; パディング (1B: origin+0x39)
+	NOP				; パディング (1B: origin+0x3A)
+	NOP				; パディング (1B: origin+0x3B)
+	NOP				; パディング (1B: origin+0x3C)
+	NOP				; パディング (1B: origin+0x3D)
+	NOP				; パディング (1B: origin+0x3E)
+	NOP				; パディング (1B: origin+0x3F)
+	NOP				; パディング (1B: origin+0x40)
+	NOP				; パディング (1B: origin+0x41)
+	NOP				; パディング (1B: origin+0x42)
+	NOP				; パディング (1B: origin+0x43)
+	NOP				; パディング (1B: origin+0x44)
 
 ;--------------------------------------------------------------
-; WBOOT: ウォームブート (0E945h 固定)
+; WBOOT: ウォームブート (origin+0x45 固定)
 ;   CCP/BDOS を SD から再ロードしてゼロページを再設定、CCP へジャンプ
 ;--------------------------------------------------------------
-WBOOT:					; == 0E945h ==
-	JP	WBOOT_BODY		; WBOOT本体へ (3B: 0xE945-0xE947)
+WBOOT:					; == origin+0x45 ==
+	JP	WBOOT_BODY		; WBOOT本体へ (3B: origin+0x45..0x47)
 
 ;--------------------------------------------------------------
 ; BOOT_BODY: BOOT本体 (WBOOTの後に配置)
 ;   CRTC初期化 → VRAMクリア → サインオン → RST7スタブ設置 → HALT
 ;--------------------------------------------------------------
 BOOT_BODY:
-	; CRTC 初期化スタブ
-	; TODO: ICW SCREEN FORMAT 詳細は実機確認 (#39 でCP-3確認)
-	; 現状の OUT (0x51), 0x00 のみでは実機μPD3301の正しい初期化に
-	; ならない可能性が高い(SCREEN FORMAT パラメータ未送出)。
-	; 80桁モード切替/カーソル設定/DMA設定/OCWは未対応。
-	; 実機/MAME での検証は #39 (CP-3) で確定する。
 	DI				; 割り込み禁止
-	LD	A, 00h
-	OUT	(51h), A		; ICW: RESET (スタブ値)
+
+	; CRTC(μPD3301)+ DMA(μPD8257 Ch2)初期化
+	;   doc/CRTC初期化.md の初期化シーケンス6ステップを実行する。
+	CALL	CRTC_INIT
 
 	; VRAM クリア
 	CALL	CLS
@@ -102,8 +120,8 @@ BOOT_LOOP:
 	JR	BOOT_LOOP
 BOOT_DONE:
 	; ローダがゼロページ/CCP/BDOSをロード済み、WBOOTがワーク初期化を行う前提で
-	; BOOT は CCP(0xD300)へ直接ジャンプする。
-	JP	0D300h
+	; BOOT は CCP(CCP_ORG)へ直接ジャンプする。
+	JP	CCP_ORG
 
 ;--------------------------------------------------------------
 ; CONST: コンソール入力状態確認
@@ -376,10 +394,12 @@ CALC_VRAM_ADDR:
 
 ;--------------------------------------------------------------
 ; CLS: 画面クリア
-;   表示部(各行80B) = 0x20、アトリビュート部(各行40B) = 0x00
+;   表示部(各行80B) = 0x20、アトリビュート部(各行40B) = 既定属性。
 ;   0xF300〜0xFEB7 (25行 × 120B = 3000B)
 ;   実装: 全3000バイトをまず 0x20 で埋め、
-;          各行のアトリビュート40バイト(+80〜+119)を0x00で上書き
+;          各行のアトリビュート40バイト(+80〜+119)を既定属性で上書き。
+;   既定属性(doc/アトリビュート.md): 各行 00h,0E8h,50h,00h,50h,00h,...
+;     先頭組=[距離0][白キャラクタ0xE8]、以降=[0x50][0x00]で安全埋め。
 ;--------------------------------------------------------------
 CLS:
 	PUSH	AF
@@ -398,20 +418,18 @@ CLS:
 	LD	BC, 0BB7h		; 残り 3000-1 = 2999 = 0xBB7 バイト
 	LDIR				; src=HL(0xF300), dst=DE(0xF301): 連鎖コピー
 
-	; 各行のアトリビュート部(+80〜+119)を 0x00 で上書き
-	; LDIR で 0xF350→0xF351, 0x40-1バイト を25行分
+	; 各行のアトリビュート部(+80〜+119)を既定属性テンプレートで上書き。
+	; ATTR_TMPL(40B) を 各行先頭(0xF350から120B間隔)へ LDIR コピー。
 	LD	B, 25			; 25行
 	LD	HL, 0F350h		; 行0のアトリビュート先頭 = 0xF300+80
 CLS_ATTR_ROW:
 	PUSH	BC
-	PUSH	HL
-	LD	(HL), 00h		; 先頭1バイトを0x00
-	LD	D, H
-	LD	E, L
-	INC	DE
-	LD	BC, 39			; 残り 40-1 = 39 バイト
-	LDIR				; アトリビュート40バイトを 0x00 でクリア
-	POP	HL
+	PUSH	HL			; HL = dst(この行のアトリビュート先頭)
+	EX	DE, HL			; DE = dst
+	LD	HL, ATTR_TMPL		; HL = src(テンプレート)
+	LD	BC, 40			; 40バイト
+	LDIR				; テンプレートをコピー
+	POP	HL			; HL = dst先頭に復元
 	; 次行のアトリビュート先頭 = 現在 HL + 120
 	LD	DE, 120
 	ADD	HL, DE
@@ -423,6 +441,24 @@ CLS_ATTR_ROW:
 	POP	BC
 	POP	AF
 	RET
+
+;--------------------------------------------------------------
+; ATTR_TMPL: CLS 用アトリビュート既定テンプレート(40バイト)
+;   00h,0E8h = 距離0・白キャラクタ(0xE8)
+;   以降 0x50,0x00 を19組(=38バイト)で安全に埋める。
+;--------------------------------------------------------------
+ATTR_TMPL:
+	DB	00h, 0E8h		; 距離0 → 白キャラクタ (2B)
+	; 残り38バイト = [0x50,0x00] × 19組
+	DB	50h, 00h, 50h, 00h, 50h, 00h, 50h, 00h, 50h, 00h	; 10B
+	DB	50h, 00h, 50h, 00h, 50h, 00h, 50h, 00h, 50h, 00h	; 10B
+	DB	50h, 00h, 50h, 00h, 50h, 00h, 50h, 00h, 50h, 00h	; 10B
+	DB	50h, 00h, 50h, 00h, 50h, 00h, 50h, 00h		; 8B
+ATTR_TMPL_END:
+	; サイズ検証(40Bでなければアセンブルエラー)
+	if	(ATTR_TMPL_END - ATTR_TMPL) <> 40
+	error	"ATTR_TMPL must be exactly 40 bytes"
+	endif
 
 ;--------------------------------------------------------------
 ; SCROLL: ソフトウェアスクロール
@@ -469,22 +505,20 @@ SCROLL_ATTR:
 ;   行0〜9 を順にスキャン、押下キーをASCII変換して返す
 ;   戻り: A = ASCII文字 (0=押下なし)
 ;
-;   ダミーマッピング(実機確定は要更新):
-;     ASCII 0x20〜0x7E を 10行×8列=80キーへ線形マップ
-;     行(0〜9)×8 + 列(0〜7) → ASCII = 0x20 + row*8 + col
-;
-;   SHIFT検出: 行0 bit6=0 で SHIFT押下
-;   CTRL検出:  行0 bit7=0 で CTRL押下
-;   ※ マトリクスダミー、実機確定は要更新
+;   ASCII変換は doc/キーボードマトリクス.md のマトリクス表に基づく
+;   テーブル変換(SCAN_TO_ASCII)。
+;   SHIFT検出: 08h D6=0 で SHIFT押下
+;   CTRL検出:  08h D7=0 で CTRL押下
+;   極性: 0=押下(アクティブロー)。反転しない。
 ;--------------------------------------------------------------
 SCAN_KBD:
 	PUSH	BC
 	PUSH	DE
 	PUSH	HL
 
-	; 行0を読んでSHIFT/CTRL状態を保存
-	IN	A, (0)
-	LD	D, A			; D = 行0の値(SHIFT/CTRL用)
+	; 修飾キー行(08h)を読んで SHIFT(D6)/CTRL(D7) 状態を保存
+	IN	A, (8)
+	LD	D, A			; D = 08hの値(SHIFT=D6, CTRL=D7)
 
 	; 行0〜9 を全行スキャン (B=行番号, C=列番号)
 	LD	B, 0			; B = 行番号
@@ -588,39 +622,62 @@ SRR_9:	IN	A, (9)
 	RET
 
 ;--------------------------------------------------------------
-; SCAN_TO_ASCII: 行B/列Cからダミーマッピングで ASCII を計算
-;   戻り: A = ASCII (0=範囲外)
-;   行0の列6(SHIFT)/列7(CTRL)は修飾キー専用のため0を返す
+; SCAN_TO_ASCII: 行B/列Cから KEYTBL を引いて 基本(非SHIFT)ASCII を返す
+;   入力: B=行番号(0-9, =ポート番号), C=列番号(0-7, =ビット番号)
+;   戻り: A = 基本ASCII (0=未割当/修飾キー)
+;   破壊: AF, HL (BCは保存)
+;   index = B*8 + C, A = (KEYTBL + index)
 ;--------------------------------------------------------------
 SCAN_TO_ASCII:
-	; 行0の列6(SHIFT)/列7(CTRL)は修飾キー専用: 除外
-	LD	A, B
-	OR	A
-	JR	NZ, STA_CALC	; 行0以外はそのまま計算
-	LD	A, C
-	CP	6
-	JR	NC, STA_EXCL	; 列6以上(=6,7)は修飾キー→除外
-STA_CALC:
+	PUSH	BC
+	; index = B*8 + C
 	LD	A, B
 	ADD	A, A
 	ADD	A, A
 	ADD	A, A		; A = B*8
 	ADD	A, C		; A = B*8 + C
-	ADD	A, 20h		; A = 0x20 + B*8 + C
-	CP	7Fh
-	JR	C, STA_OK	; < 0x7F → 有効
-STA_EXCL:
-	XOR	A		; 範囲外/修飾キー: 無効
-STA_OK:
+	; HL = KEYTBL + index
+	LD	HL, KEYTBL
+	LD	C, A
+	LD	B, 0
+	ADD	HL, BC
+	LD	A, (HL)		; A = 基本ASCII
+	POP	BC
 	RET
 
 ;--------------------------------------------------------------
+; KEYTBL: 行(=ポート0-9)×列(=ビット0-7) → 基本(非SHIFT)ASCII テーブル(80B)
+;   doc/キーボードマトリクス.md のマトリクス表に基づく。
+;   英字は大文字を基本値とし、SHIFT で小文字へトグル(SCAN_MOD)。
+;   0 = 未割当 / 修飾キー(SHIFT/CTRL/カナ/GRPH/ファンクション等)。
+;   ※ 一部キートップ刻印・SHIFT記号は実機(#39)で要確定。
+;--------------------------------------------------------------
+KEYTBL:
+	DB	030h, 031h, 032h, 033h, 034h, 035h, 036h, 037h	; 00h: 0-7
+	DB	038h, 039h, 02Ah, 02Bh, 03Dh, 02Ch, 02Eh, 00Dh	; 01h: 8 9 * + = , . RET
+	DB	040h, 041h, 042h, 043h, 044h, 045h, 046h, 047h	; 02h: @ A B C D E F G
+	DB	048h, 049h, 04Ah, 04Bh, 04Ch, 04Dh, 04Eh, 04Fh	; 03h: H I J K L M N O
+	DB	050h, 051h, 052h, 053h, 054h, 055h, 056h, 057h	; 04h: P Q R S T U V W
+	DB	058h, 059h, 05Ah, 05Bh, 05Ch, 05Dh, 05Eh, 03Dh	; 05h: X Y Z [ \ ] ^ =
+	DB	030h, 031h, 032h, 033h, 034h, 035h, 036h, 037h	; 06h: テンキー 0-7
+	DB	038h, 039h, 02Ah, 02Bh, 03Bh, 03Ah, 02Fh, 05Fh	; 07h: テンキー 8 9 * + ; : / _
+	DB	000h, 000h, 000h, 07Fh, 000h, 000h, 000h, 000h	; 08h: 修飾(D3=INS/DEL=0x7F)
+	DB	000h, 000h, 000h, 000h, 000h, 000h, 020h, 01Bh	; 09h: STOP f1-5 SPACE ESC
+KEYTBL_END:
+	if	(KEYTBL_END - KEYTBL) <> 80
+	error	"KEYTBL must be exactly 80 bytes"
+	endif
+
+;--------------------------------------------------------------
 ; SCAN_MOD: CTRL/SHIFT 修飾を A に適用
-;   入力: A = ASCII (0x20〜0x7E), D = 行0の値
+;   入力: A = 基本ASCII, D = 08hの値(SHIFT=D6, CTRL=D7; 押下=0)
 ;   戻り: A = 変換後 ASCII
+;   英字(A-Z): CTRL→0x01-0x1A, SHIFT→小文字へトグル。
+;   ※ 数字・記号の SHIFT 変換(例: 2→@ 等)はキートップ未確定のため
+;     現状は基本値を通す(必要時に例外表で対応; 実機 #39 で確定)。
 ;--------------------------------------------------------------
 SCAN_MOD:
-	; CTRL 確認: bit7=0 → CTRL押下
+	; CTRL 確認: D7=0 → CTRL押下
 	BIT	7, D
 	JR	NZ, SMOD_NO_CTRL
 	; CTRL変換: アルファベットを 0x01〜0x1A に
@@ -638,7 +695,7 @@ SMOD_CTRL_CHK:
 	RET
 
 SMOD_NO_CTRL:
-	; SHIFT 確認: bit6=0 → SHIFT押下
+	; SHIFT 確認: D6=0 → SHIFT押下
 	BIT	6, D
 	RET	NZ		; SHIFT未押下: そのまま
 	; SHIFT: 大小文字トグル
@@ -676,6 +733,84 @@ READER:
 	LD	A, 1Ah
 	RET
 
+;--------------------------------------------------------------
+; CRTC_INIT: μPD3301(CRTC) + μPD8257(DMA Ch2) 初期化
+;   doc/CRTC初期化.md の初期化シーケンス(6ステップ)を実行する。
+;   80桁×25行・200ライン・トランスペアレントカラー。
+;   破壊: AF, B, HL
+;
+;   1. OUT(51h),00h           ICW RESET
+;   2. DMA設定: (port,value)テーブル CRTC_DMA_TBL を順送出
+;        64h<-00h,64h<-0F3h, 65h<-0B7h,65h<-4Bh, 68h<-84h
+;   3. FORMAT1-5: 50h へ 4Eh,18h,67h,0DEh,53h を順送出
+;   4. OUT(51h),43h           OCW3 SET INTERRUPT MASK
+;   5. OUT(51h),20h           OCW2 START DISPLAY
+;   6. OUT(40h),00h           /CLDS=0(表示有効化)
+;      ※ 0x40 の他ビット(CMT/BEEP等)の実機既定は未確定。
+;        d3=0 のみ意図し残りは 0x00 でスタブ。実機(#39)で確定する。
+;--------------------------------------------------------------
+CRTC_INIT:
+	; 手順1: ICW RESET
+	XOR	A
+	OUT	(51h), A		; OUT(51h),00h
+
+	; 手順2: DMA(μPD8257 Ch2)設定 — (port,value)テーブルを順送出
+	LD	HL, CRTC_DMA_TBL
+	LD	B, CRTC_DMA_LEN		; 組数(=5)
+CRTC_DMA_LOOP:
+	LD	C, (HL)			; C = ポート番号
+	INC	HL
+	LD	A, (HL)			; A = 送出値
+	INC	HL
+	OUT	(C), A			; OUT(C),A
+	DJNZ	CRTC_DMA_LOOP
+
+	; 手順3: ICW SCREEN FORMAT 1-5 を 50h へ順送出
+	LD	HL, CRTC_FMT_TBL
+	LD	B, CRTC_FMT_LEN		; バイト数(=5)
+CRTC_FMT_LOOP:
+	LD	A, (HL)
+	OUT	(50h), A		; OUT(50h),FORMATn
+	INC	HL
+	DJNZ	CRTC_FMT_LOOP
+
+	; 手順4: OCW3 SET INTERRUPT MASK
+	LD	A, 43h
+	OUT	(51h), A
+	; 手順5: OCW2 START DISPLAY
+	LD	A, 20h
+	OUT	(51h), A
+	; 手順6: /CLDS=0(表示有効化)。他ビットは実機(#39)で確定。
+	XOR	A
+	OUT	(40h), A		; OUT(40h),00h (d3=0 スタブ)
+	RET
+
+;--------------------------------------------------------------
+; CRTC_DMA_TBL: μPD8257 Ch2 設定テーブル (ポート,値) × 5組
+;   64h<-00h/0F3h(DMAアドレス0xF300), 65h<-0B7h/4Bh(カウント2999+Rd),
+;   68h<-84h(オートロード+Ch2有効)
+;--------------------------------------------------------------
+CRTC_DMA_TBL:
+	DB	64h, 00h		; DMAアドレス下位
+	DB	64h, 0F3h		; DMAアドレス上位 (=0xF300)
+	DB	65h, 0B7h		; ターミナルカウント下位 (2999=0x0BB7)
+	DB	65h, 4Bh		; カウント上位+リードサイクル(Wr=1)
+	DB	68h, 84h		; モードセット: AL=1 + EN2=1
+CRTC_DMA_END:
+CRTC_DMA_LEN	equ	(CRTC_DMA_END - CRTC_DMA_TBL) / 2
+
+;--------------------------------------------------------------
+; CRTC_FMT_TBL: ICW SCREEN FORMAT 1-5 (50h へ順送出)
+;--------------------------------------------------------------
+CRTC_FMT_TBL:
+	DB	4Eh			; FORMAT1: 80桁・DMAバースト
+	DB	18h			; FORMAT2: 25行・ブリンク00
+	DB	67h			; FORMAT3: 8ライン/文字・反転ブロックカーソル
+	DB	0DEh			; FORMAT4: 垂直帰線7行・水平帰線32文字
+	DB	53h			; FORMAT5: トランスペアレントカラー・20アトリ/行
+CRTC_FMT_END:
+CRTC_FMT_LEN	equ	CRTC_FMT_END - CRTC_FMT_TBL
+
 SIGNON:
 	DB	'PC-8001 CP/M 2.2 BIOS', 0
 
@@ -694,8 +829,9 @@ KEYBUF:
 	DB	0
 
 ;==============================================================
-; ウォームブート補助ルーチン群 (0xEBE6-0xEBFF)
-;   KEYBUF(0xEBE5)の後、SDジャンプテーブル(0xEC00)の前に配置
+; ウォームブート補助ルーチン群
+;   KEYBUF の後、SDブロックドライバ固定ジャンプテーブルの前に連続配置。
+;   (配置アドレスは origin から連続レイアウトで決まる)
 ;==============================================================
 
 ;--------------------------------------------------------------
@@ -727,10 +863,11 @@ FDB_DONE:
 	RET
 
 ;==============================================================
-; SDブロックドライバ(#33)固定ジャンプテーブル
-;   SD_INIT_VEC  = 0EC00h  (CALL 0EC00h でSD初期化)
-;   SD_READ_VEC  = 0EC03h  (CALL 0EC03h でブロック読込)
-;   SD_WRITE_VEC = 0EC06h  (CALL 0EC06h でブロック書込)
+; SDブロックドライバ(#33)ジャンプテーブル
+;   SD_INIT_VEC  : SD初期化
+;   SD_READ_VEC  : ブロック読込
+;   SD_WRITE_VEC : ブロック書込
+;   (シンボル参照で呼ぶ。配置は origin から連続レイアウトで決まる)
 ;==============================================================
 
 SD_INIT_VEC:
@@ -1154,18 +1291,20 @@ SD_WR_ARG:
 	DB	0FFh			; CRC
 
 ;--------------------------------------------------------------
-; ゼロページ設定データ (固定アドレス 0xEDEF)
-;   SDコマンドテーブル末尾(0xEDEE)の直後、SD_BUF(0xEE00)の前
+; ゼロページ設定データ
+;   SDコマンドテーブル末尾の直後、SD_BUF の前に配置(連続レイアウト)。
 ;   WBOOTのゼロページ初期化LDIR処理から参照する。
+;   WBOOTベクタ = origin+3(ジャンプテーブルの JP WBOOT エントリ)。
+;   BDOSエントリ = BDOS_ORG+6。
 ;--------------------------------------------------------------
 
 WB_ZP_DATA:
-	DB	0C3h, 03h, 0E9h		; 0x0000: JP 0xE903 (WBOOT)
+	DB	0C3h, (origin+3)&0FFh, ((origin+3)>>8)&0FFh	; 0x0000: JP origin+3 (WBOOT)
 	DB	00h, 00h		; 0x0003-0x0004: IOBYTE=0, ドライブ=A
-	DB	0C3h, 06h, 0DBh		; 0x0005: JP 0xDB06 (BDOS)
+	DB	0C3h, (BDOS_ORG+6)&0FFh, ((BDOS_ORG+6)>>8)&0FFh	; 0x0005: JP BDOS_ORG+6 (BDOS)
 
 ;--------------------------------------------------------------
-; SD用データ領域 (固定アドレス 0xEE00)
+; SD用データ領域 (SDコマンドテーブル末尾の直後に連続配置)
 ;--------------------------------------------------------------
 
 SD_BUF:
@@ -1175,7 +1314,7 @@ SD_CCS:
 	DB	0			; カード種別 (0=SDSC, 非0=SDHC)
 
 ;==============================================================
-; ディスク層ワーク領域 (0xF001 以降, SD_CCS=0xF000の直後)
+; ディスク層ワーク領域 (SD_CCS の直後に連続配置)
 ;==============================================================
 
 CUR_DISK:
@@ -1206,8 +1345,7 @@ DISK_LBA_TMP:
 	DS	4			; ENSURE_BUF内部ワーク(目標LBA)
 
 ;==============================================================
-; DPB共通 (15バイト, 固定アドレス 0xF020)
-; ワーク領域終端 0xF013 の後、パディングを挟んで 0xF020 に配置
+; DPB共通 (15バイト, ワーク領域の直後に連続配置)
 ; SPT=64, BSH=4, BLM=15, EXM=0, DSM=1023, DRM=511,
 ; AL0=0xFF, AL1=0x00, CKS=0, OFF=2
 ;==============================================================
@@ -1225,23 +1363,33 @@ DPB_COMMON:
 	DW	2			; OFF: システム予約トラック数
 
 ;==============================================================
-; DIRBUF共通 (128バイト, 固定アドレス 0xF030)
-; DPB 15B: 0xF020-0xF02E → DIRBUF開始は 0xF030 (1バイトパディング)
+; DIRBUF共通 (128バイト, DPB の直後に連続配置)
 ;==============================================================
 
 DIRBUF:
 	DS	128			; ディレクトリバッファ
 
 ;==============================================================
-; DPHテーブル (8ドライブ×16バイト = 128バイト, 0xF0B0)
-; DIRBUF 128B: 0xF030-0xF0AF → DPHテーブル開始は 0xF0B0
+; ALVバッファ(アロケーションベクタ, 8ドライブ×128B = 1024B)
+;   DSM=1023 → ALVサイズ = (DSM/8)+1 = 128バイト/ドライブ。
+;   各ドライブのALVは独立領域が必須(共有不可)。BDOSが起動時に
+;   ディレクトリを走査してブロック使用状況をこのビットマップに構築する。
+;   ※ これが未確保(ALV=0)だと BDOS が NULL ポインタ(0x0000=ゼロページ)を
+;     破壊する致命バグになる。CKS=0 でも ALV は常に必須(省略可なのは CSV のみ)。
+;==============================================================
+
+ALV_BUF:
+	DS	128*8			; 8ドライブ分のALV(各128B)
+
+;==============================================================
+; DPHテーブル (8ドライブ×16バイト = 128バイト)
 ; 各DPH構成:
-;   XLT   (2B) = 0      (恒等変換のためNULL)
-;   000000(6B)           (予約0)
-;   DIRBUF(2B) = DIRBUF
-;   DPB   (2B) = DPB_COMMON
-;   CSV   (2B) = 0      (CKS=0のためNULL)
-;   ALV   (2B) = 0      (テスト用省略; BDOSはCKS=0時ALVも省略可)
+;   XLT   (2B) = 0          (恒等変換のためNULL)
+;   000000(6B)               (予約0)
+;   DIRBUF(2B) = DIRBUF      (全ドライブ共有)
+;   DPB   (2B) = DPB_COMMON  (全ドライブ共有)
+;   CSV   (2B) = 0           (CKS=0のためNULL; 省略可)
+;   ALV   (2B) = ALV_BUF+d*128 (ドライブ毎に独立; 必須)
 ;==============================================================
 
 DPH_TABLE:
@@ -1250,65 +1398,62 @@ DPH0:	DW	0		; XLT
 	DW	DIRBUF		; DIRBUF
 	DW	DPB_COMMON	; DPB
 	DW	0		; CSV
-	DW	0		; ALV
+	DW	ALV_BUF+0*128	; ALV (ドライブ0)
 
 DPH1:	DW	0
 	DW	0,0,0
 	DW	DIRBUF
 	DW	DPB_COMMON
 	DW	0
-	DW	0
+	DW	ALV_BUF+1*128	; ALV (ドライブ1)
 
 DPH2:	DW	0
 	DW	0,0,0
 	DW	DIRBUF
 	DW	DPB_COMMON
 	DW	0
-	DW	0
+	DW	ALV_BUF+2*128	; ALV (ドライブ2)
 
 DPH3:	DW	0
 	DW	0,0,0
 	DW	DIRBUF
 	DW	DPB_COMMON
 	DW	0
-	DW	0
+	DW	ALV_BUF+3*128	; ALV (ドライブ3)
 
 DPH4:	DW	0
 	DW	0,0,0
 	DW	DIRBUF
 	DW	DPB_COMMON
 	DW	0
-	DW	0
+	DW	ALV_BUF+4*128	; ALV (ドライブ4)
 
 DPH5:	DW	0
 	DW	0,0,0
 	DW	DIRBUF
 	DW	DPB_COMMON
 	DW	0
-	DW	0
+	DW	ALV_BUF+5*128	; ALV (ドライブ5)
 
 DPH6:	DW	0
 	DW	0,0,0
 	DW	DIRBUF
 	DW	DPB_COMMON
 	DW	0
-	DW	0
+	DW	ALV_BUF+6*128	; ALV (ドライブ6)
 
 DPH7:	DW	0
 	DW	0,0,0
 	DW	DIRBUF
 	DW	DPB_COMMON
 	DW	0
-	DW	0
+	DW	ALV_BUF+7*128	; ALV (ドライブ7)
 
 
 ;==============================================================
-; ディスクBIOS実装 (固定アドレス 0xF130)
+; ディスクBIOS実装 (DPHテーブルの直後に連続配置)
 ;   ジャンプテーブルから直接参照される。
-;   SD区域(0xEC00-0xEDFF)/データ領域(0xF000-0xF12F)の
-;   どちらとも重複しない 0xF130 に配置する。
-;   DPHテーブル終端 0xF0B0+128=0xF130 に続けて配置。
-;   VRAMは 0xF300 から。コード領域約 0x1D0=464バイト。
+;   VRAMは 0xF300(固定)から。BIOS全体が origin..0xF2FF に収まること。
 ;==============================================================
 
 ;--------------------------------------------------------------
@@ -1672,24 +1817,24 @@ WRITE_FROM_DMA:
 	RET
 
 ;==============================================================
-; ウォームブート本体・サブルーチン (#36, 0xF2B4以降)
-;   ディスクBIOS(0xF130-0xF2B3)の直後、VRAM(0xF300)の前に配置
+; ウォームブート本体・サブルーチン (#36)
+;   ディスクBIOSの直後、VRAM(0xF300)の前に連続配置
 ;==============================================================
 
 ;--------------------------------------------------------------
 ; WBOOT_BODY: ウォームブート本体
-;   1. SPをBIOS専用スタック(0xF300)に設定(BDOSロード先0xE8FFより上)
+;   1. SPをBIOS専用スタック(BIOS_STACK=VRAM領域)に設定
 ;   2. DI
 ;   3. ダーティバッファフラッシュ
-;   4. SD から CCP/BDOS 再ロード(LBA5-15 → 0xD300-0xE8FF)
+;   4. SD から CCP/BDOS 再ロード(CCP_LBA..(CCP_LBA+10) → CCP_ORG..BDOS末尾)
 ;   5. ゼロページ再設定(0x0000-0x0007 LDIRで書込)
 ;   6. RST7スタブ設置(INSTALL_RST7_STUB呼出)
 ;   7. ワーク初期化(CUR_DISK=0, CUR_DMA=0x0080)
 ;      (CUR_TRACK/CUR_SECTORはBDOSが常にSETTRK/SETSECで設定するため省略)
-;   8. CCP(0xD300)へジャンプ
+;   8. CCP(CCP_ORG)へジャンプ
 ;--------------------------------------------------------------
 WBOOT_BODY:
-	LD	SP, 0F380h		; BIOS専用スタック(VRAM領域、BIOSコード末尾+余裕)
+	LD	SP, BIOS_STACK		; BIOS専用スタック(VRAM領域、BIOSコード末尾+余裕)
 	DI				; 割り込み禁止
 	CALL	FLUSH_DIRTY_BUF		; ダーティバッファフラッシュ
 	CALL	LOAD_CPM_FROM_SD	; CCP/BDOS 再ロード
@@ -1706,21 +1851,22 @@ WBOOT_BODY:
 	LD	(CUR_DISK), A		; カレントドライブ = A(0)
 	LD	HL, 0080h
 	LD	(CUR_DMA), HL		; DMAアドレス = 0x0080(デフォルト)
-	; CCP(0xD300)へジャンプ
-	JP	0D300h
+	; CCP(CCP_ORG)へジャンプ
+	JP	CCP_ORG
 
 ;--------------------------------------------------------------
 ; LOAD_CPM_FROM_SD: CCP/BDOSをSDから一括再ロード
-;   LBA5-15(11ブロック)を0xD300-0xE8FFへ連続ロード。
-;   CCP:  LBA5-8  → 0xD300-0xDAFF
-;   BDOS: LBA9-15 → 0xDB00-0xE8FF
+;   CCP_LBA..(CCP_LBA+10)(11ブロック)を CCP_ORG から連続ロード。
+;   CCP:  CCP_LBA  .. CCP_LBA+3  → CCP_ORG  (4ブロック)
+;   BDOS: BDOS_LBA .. BDOS_LBA+6 → BDOS_ORG (7ブロック)
+;   ※ CCP/BDOSは連続配置(BDOS_ORG = CCP_ORG + 2048)のため一括ロード可能。
 ;   IX=LBAカウンタ(SD_READ_BLOCKで保存)、DE=dstアドレス
 ;   SD_READ_BLOCK破壊: AF,BC,HL (DE・IXは保存される)
 ;   LDIR後のDE(=旧dst+512)をそのまま次ループのdstとして使用。
 ;--------------------------------------------------------------
 LOAD_CPM_FROM_SD:
-	LD	IX, 5			; IX = 開始LBA(5)
-	LD	DE, 0D300h		; DE = ロード先先頭(CCP=0xD300)
+	LD	IX, CCP_LBA		; IX = 開始LBA(CCP_LBA)
+	LD	DE, CCP_ORG		; DE = ロード先先頭(CCP_ORG)
 	LD	B, 11			; B = ブロック数(11=CCP4+BDOS7)
 LCPM_LOOP:
 	PUSH	BC			; ブロック数を保存

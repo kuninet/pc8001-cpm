@@ -3,7 +3,7 @@
 実行: PYTHONPATH=external/z80 .venv/bin/python -m pytest tests/test_loader.py -q
 
 テスト概要:
-  - SDの先頭16ブロックにダミーパターンを書き込む
+  - SDの先頭18ブロックにダミーパターンを書き込む
   - ローダ(loader.bin)を拡張ROM領域(0x6000)に配置して実行
   - CP/M本体(BIOS/CCP/BDOS)が正しい位置に配置されることを確認
   - ゼロページ(0x0000-0x0007)が正しく初期化されることを確認
@@ -18,12 +18,14 @@ import pytest
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from emu.pc8001 import PC8001
 from emu.sdcard import SDCard
+import memmap
 
 # ---------------------------------------------------------------
-# 定数
+# 定数(配置は tests/memmap.py で BIOS_BLOCKS から導出)
 # ---------------------------------------------------------------
 LOADER_ORG  = 0x6000
 LOADER_BIN  = os.path.join(PROJECT_ROOT, "build", "loader.bin")
@@ -31,22 +33,22 @@ LOADER_SRC  = os.path.join(PROJECT_ROOT, "src", "loader", "loader.asm")
 BUILD_DIR   = os.path.join(PROJECT_ROOT, "build")
 
 # CP/M 配置アドレス
-BIOS_ADDR   = 0xE900
-CCP_ADDR    = 0xD300
-BDOS_ADDR   = 0xDB00
+BIOS_ADDR   = memmap.BIOS_ADDR
+CCP_ADDR    = memmap.CCP_ADDR
+BDOS_ADDR   = memmap.BDOS_ADDR
 
-# SDレイアウト(設計02準拠)
-BIOS_LBA_START  = 0
-BIOS_BLOCKS     = 5
-CCP_LBA_START   = 5
-CCP_BLOCKS      = 4
-BDOS_LBA_START  = 9
-BDOS_BLOCKS     = 7
-BLOCK_SIZE      = 512
+# SDレイアウト(BIOS_BLOCKS から導出)
+BIOS_LBA_START  = memmap.BIOS_LBA_START
+BIOS_BLOCKS     = memmap.BIOS_BLOCKS
+CCP_LBA_START   = memmap.CCP_LBA_START
+CCP_BLOCKS      = memmap.CCP_BLOCKS
+BDOS_LBA_START  = memmap.BDOS_LBA_START
+BDOS_BLOCKS     = memmap.BDOS_BLOCKS
+BLOCK_SIZE      = memmap.BLOCK_SIZE
 
 # ゼロページ期待値
-ZP_JP_WBOOT   = [0xC3, 0x03, 0xE9]   # JP 0xE903
-ZP_JP_BDOS    = [0xC3, 0x06, 0xDB]   # JP 0xDB06
+ZP_JP_WBOOT   = memmap.ZP_JP_WBOOT   # JP (BIOS_ORG+3)
+ZP_JP_BDOS    = memmap.ZP_JP_BDOS    # JP (BDOS_ORG+6)
 
 
 # ---------------------------------------------------------------
@@ -62,7 +64,7 @@ def _build_loader() -> None:
     hex_file = os.path.join(BUILD_DIR, "loader.hex")
 
     result = subprocess.run(
-        ["asl", "-o", p_file, LOADER_SRC],
+        ["asl", *memmap.loader_asl_defines(), "-o", p_file, LOADER_SRC],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -103,17 +105,17 @@ def _make_sd_image() -> bytearray:
     """
     テスト用SDイメージを作成する。
     各ブロックの全バイトをそのブロックを識別するパターンで埋める。
-      LBA 0-4  (BIOS): 各ブロック先頭バイト = 0xB0, 0xB1, ..., 0xB4
-      LBA 5-8  (CCP):  0xC0, 0xC1, 0xC2, 0xC3
-      LBA 9-15 (BDOS): 0xD0, 0xD1, ..., 0xD6
+      LBA 0-6  (BIOS): 各ブロック先頭バイト = 0xB0, 0xB1, ..., 0xB6
+      LBA 7-10 (CCP):  0xC0, 0xC1, 0xC2, 0xC3
+      LBA 11-17(BDOS): 0xD0, 0xD1, ..., 0xD6
     BIOSの先頭(LBA0の先頭バイト)は HALT(0x76) を置く。
     ローダがBIOS BOOTへJPした後、即座にHALTしてrun_until_haltが返るようにする。
     """
-    # 十分な大きさ(最低16ブロック = 8KB)
+    # 十分な大きさ(最低18ブロック = 9KB)
     image = bytearray(256 * BLOCK_SIZE)
 
-    # BIOS ブロック(LBA 0-4): LBA0の先頭は HALT(0x76)
-    bios_patterns = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4]
+    # BIOS ブロック(LBA 0-6): LBA0の先頭は HALT(0x76)
+    bios_patterns = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6]
     for i, pat in enumerate(bios_patterns):
         lba = BIOS_LBA_START + i
         block = bytearray([pat] * BLOCK_SIZE)
@@ -121,14 +123,14 @@ def _make_sd_image() -> bytearray:
             block[0] = 0x76  # HALT: BIOS BOOTへジャンプ後すぐ停止
         image[lba * BLOCK_SIZE:(lba + 1) * BLOCK_SIZE] = block
 
-    # CCP ブロック(LBA 5-8)
+    # CCP ブロック(LBA 7-10)
     ccp_patterns = [0xC0, 0xC1, 0xC2, 0xC3]
     for i, pat in enumerate(ccp_patterns):
         lba = CCP_LBA_START + i
         block = bytearray([pat] * BLOCK_SIZE)
         image[lba * BLOCK_SIZE:(lba + 1) * BLOCK_SIZE] = block
 
-    # BDOS ブロック(LBA 9-15)
+    # BDOS ブロック(LBA 11-17)
     bdos_patterns = [0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6]
     for i, pat in enumerate(bdos_patterns):
         lba = BDOS_LBA_START + i
@@ -187,65 +189,65 @@ class TestLoaderBoot:
 
     def test_loader_bios_placed(self):
         """
-        ローダ実行後、BIOSダミーが 0xE900 に配置されていること。
+        ローダ実行後、BIOSダミーが 0xE500 に配置されていること。
         LBA0のブロックは先頭バイト=HALT(0x76)、残りは 0xB0。
         """
         pc, sd = setup_loader_env()
         halted = self._run_loader(pc)
         assert halted, "ローダ: HALT に到達しなかった"
 
-        # BIOS先頭(0xE900)はHALT(0x76)
+        # BIOS先頭(0xE500)はHALT(0x76)
         val = pc._mem_read(BIOS_ADDR)
-        assert val == 0x76, f"BIOS先頭 0xE900={val:#04x} (expected 0x76 HALT)"
+        assert val == 0x76, f"BIOS先頭 0xE500={val:#04x} (expected 0x76 HALT)"
 
-        # LBA0の2バイト目以降(0xE901〜): 0xB0 パターン
+        # LBA0の2バイト目以降(0xE501〜): 0xB0 パターン
         val2 = pc._mem_read(BIOS_ADDR + 1)
-        assert val2 == 0xB0, f"BIOS 0xE901={val2:#04x} (expected 0xB0)"
+        assert val2 == 0xB0, f"BIOS 0xE501={val2:#04x} (expected 0xB0)"
 
-        # LBA1の先頭(0xE900+512=0xEB00): 0xB1
+        # LBA1の先頭(0xE500+512=0xE700): 0xB1
         val3 = pc._mem_read(BIOS_ADDR + BLOCK_SIZE)
-        assert val3 == 0xB1, f"BIOS 0xEB00={val3:#04x} (expected 0xB1)"
+        assert val3 == 0xB1, f"BIOS 0xE700={val3:#04x} (expected 0xB1)"
 
     def test_loader_ccp_placed(self):
         """
-        ローダ実行後、CCPダミーが 0xD300 に配置されていること。
-        LBA5のブロックは全バイト 0xC0。
+        ローダ実行後、CCPダミーが 0xCF00 に配置されていること。
+        LBA7のブロックは全バイト 0xC0。
         """
         pc, sd = setup_loader_env()
         self._run_loader(pc)
 
-        # CCP先頭(0xD300): LBA5パターン 0xC0
+        # CCP先頭(0xCF00): LBA7パターン 0xC0
         val = pc._mem_read(CCP_ADDR)
-        assert val == 0xC0, f"CCP先頭 0xD300={val:#04x} (expected 0xC0)"
+        assert val == 0xC0, f"CCP先頭 0xCF00={val:#04x} (expected 0xC0)"
 
-        # LBA6の先頭(0xD300+512=0xD500): 0xC1
+        # LBA8の先頭(0xCF00+512=0xD100): 0xC1
         val2 = pc._mem_read(CCP_ADDR + BLOCK_SIZE)
-        assert val2 == 0xC1, f"CCP 0xD500={val2:#04x} (expected 0xC1)"
+        assert val2 == 0xC1, f"CCP 0xD100={val2:#04x} (expected 0xC1)"
 
     def test_loader_bdos_placed(self):
         """
-        ローダ実行後、BDOSダミーが 0xDB00 に配置されていること。
-        LBA9のブロックは全バイト 0xD0。
+        ローダ実行後、BDOSダミーが 0xD700 に配置されていること。
+        LBA11のブロックは全バイト 0xD0。
         """
         pc, sd = setup_loader_env()
         self._run_loader(pc)
 
-        # BDOS先頭(0xDB00): LBA9パターン 0xD0
+        # BDOS先頭(0xD700): LBA11パターン 0xD0
         val = pc._mem_read(BDOS_ADDR)
-        assert val == 0xD0, f"BDOS先頭 0xDB00={val:#04x} (expected 0xD0)"
+        assert val == 0xD0, f"BDOS先頭 0xD700={val:#04x} (expected 0xD0)"
 
-        # LBA10の先頭(0xDB00+512=0xDD00): 0xD1
+        # LBA12の先頭(0xD700+512=0xD900): 0xD1
         val2 = pc._mem_read(BDOS_ADDR + BLOCK_SIZE)
-        assert val2 == 0xD1, f"BDOS 0xDD00={val2:#04x} (expected 0xD1)"
+        assert val2 == 0xD1, f"BDOS 0xD900={val2:#04x} (expected 0xD1)"
 
     def test_loader_zero_page_wboot(self):
         """
-        ローダ実行後、0x0000-0x0002 が JP 0xE903 (WBOOT) になっていること。
+        ローダ実行後、0x0000-0x0002 が JP 0xE503 (WBOOT) になっていること。
         """
         pc, sd = setup_loader_env()
         self._run_loader(pc)
 
-        # 0x0000-0x0002: JP 0xE903
+        # 0x0000-0x0002: JP 0xE503
         for i, expected in enumerate(ZP_JP_WBOOT):
             val = pc._mem_read(i)
             assert val == expected, (
@@ -254,12 +256,12 @@ class TestLoaderBoot:
 
     def test_loader_zero_page_bdos(self):
         """
-        ローダ実行後、0x0005-0x0007 が JP 0xDB06 (BDOSエントリ) になっていること。
+        ローダ実行後、0x0005-0x0007 が JP 0xD706 (BDOSエントリ) になっていること。
         """
         pc, sd = setup_loader_env()
         self._run_loader(pc)
 
-        # 0x0005-0x0007: JP 0xDB06
+        # 0x0005-0x0007: JP 0xD706
         for i, expected in enumerate(ZP_JP_BDOS):
             addr = 0x0005 + i
             val = pc._mem_read(addr)
@@ -291,13 +293,13 @@ class TestLoaderBoot:
 
     def test_loader_bios_all_blocks(self):
         """
-        BIOSの全ブロック(LBA 0-4, 2560B)が正しく配置されていること。
+        BIOSの全ブロック(LBA 0-6, 3584B)が正しく配置されていること。
         各ブロックのパターンバイト確認。
         """
         pc, sd = setup_loader_env()
         self._run_loader(pc)
 
-        patterns = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4]
+        patterns = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6]
         for i, pat in enumerate(patterns):
             addr = BIOS_ADDR + i * BLOCK_SIZE
             if i == 0:
@@ -314,7 +316,7 @@ class TestLoaderBoot:
 
     def test_loader_bdos_all_blocks(self):
         """
-        BDOSの全ブロック(LBA 9-15, 3584B)が正しく配置されていること。
+        BDOSの全ブロック(LBA 11-17, 3584B)が正しく配置されていること。
         """
         pc, sd = setup_loader_env()
         self._run_loader(pc)
@@ -355,7 +357,7 @@ class TestLoaderSDFailure:
         # BIOSは未ロード: 本体RAMの初期値=0x00
         bios_byte = pc._mem_read(BIOS_ADDR)
         assert bios_byte == 0x00, (
-            f"BIOS領域に何か書かれている: 0xE900={bios_byte:#04x}"
+            f"BIOS領域に何か書かれている: 0xE500={bios_byte:#04x}"
         )
 
         # ゼロページは初期化されていない(JP=0xC3 ではない)

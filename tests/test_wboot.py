@@ -4,7 +4,7 @@ WBOOT・RST7スタブ テスト (#36)
 
 テスト概要:
   - SDイメージにCCP/BDOSダミーパターンを配置
-  - WBOOT(0xE945)を実行後、CCP/BDOSが正しい位置に再ロードされることを確認
+  - WBOOT(0xE545)を実行後、CCP/BDOSが正しい位置に再ロードされることを確認
   - ゼロページ(0x0000-0x0007)が正しく再設定されることを確認
   - RST7ベクタ(0x0038)にRET(0xC9)が書き込まれることを確認
   - CUR_DMA=0x0080、CUR_DISK=0 に初期化されることを確認
@@ -24,34 +24,34 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from emu.pc8001 import PC8001
 from emu.sdcard import SDCard
 from bios_syms import sym
+import memmap
 
 # ---------------------------------------------------------------
-# 定数
+# 定数(配置は tests/memmap.py で BIOS_BLOCKS から導出)
 # ---------------------------------------------------------------
-BIOS_ORG    = 0xE900
+BIOS_ORG    = memmap.BIOS_ADDR
 BIOS_BIN    = os.path.join(PROJECT_ROOT, "build", "bios.bin")
 BIOS_SRC    = os.path.join(PROJECT_ROOT, "src", "bios", "bios.asm")
 BUILD_DIR   = os.path.join(PROJECT_ROOT, "build")
 
-# BIOS ジャンプテーブル: vec(n) = 0xE900 + 3*n
-def vec(n: int) -> int:
-    return BIOS_ORG + 3 * n
+# BIOS ジャンプテーブル: vec(n) = BIOS_ORG + 3*n
+vec = memmap.vec
 
 # ベクタアドレス
-WBOOT_ADDR      = 0xE945    # WBOOT エントリ固定アドレス
+WBOOT_ADDR      = memmap.WBOOT_ENTRY    # WBOOT エントリ(origin+0x45)
 
 # CP/M メモリマップ
-CCP_ADDR        = 0xD300    # CCP ロード先
-BDOS_ADDR       = 0xDB00    # BDOS ロード先
-CCP_BLOCKS      = 4         # CCP SD ブロック数
-BDOS_BLOCKS     = 7         # BDOS SD ブロック数
-CCP_LBA_START   = 5         # CCP 開始 LBA
-BDOS_LBA_START  = 9         # BDOS 開始 LBA
-BLOCK_SIZE      = 512       # SD ブロックサイズ
+CCP_ADDR        = memmap.CCP_ADDR       # CCP ロード先
+BDOS_ADDR       = memmap.BDOS_ADDR      # BDOS ロード先
+CCP_BLOCKS      = memmap.CCP_BLOCKS     # CCP SD ブロック数
+BDOS_BLOCKS     = memmap.BDOS_BLOCKS    # BDOS SD ブロック数
+CCP_LBA_START   = memmap.CCP_LBA_START  # CCP 開始 LBA
+BDOS_LBA_START  = memmap.BDOS_LBA_START # BDOS 開始 LBA
+BLOCK_SIZE      = memmap.BLOCK_SIZE     # SD ブロックサイズ
 
 # ゼロページ期待値
-ZP_JP_WBOOT     = [0xC3, 0x03, 0xE9]   # JP 0xE903 (WBOOT)
-ZP_JP_BDOS      = [0xC3, 0x06, 0xDB]   # JP 0xDB06 (BDOS)
+ZP_JP_WBOOT     = memmap.ZP_JP_WBOOT    # JP (BIOS_ORG+3) (WBOOT)
+ZP_JP_BDOS      = memmap.ZP_JP_BDOS     # JP (BDOS_ORG+6) (BDOS)
 
 
 # ---------------------------------------------------------------
@@ -65,14 +65,14 @@ def _build_bios() -> None:
     bin_file = BIOS_BIN
 
     result = subprocess.run(
-        ["asl", "-D", "origin=0E900h", "-o", p_file, BIOS_SRC],
+        ["asl", *memmap.bios_asl_defines(), "-o", p_file, BIOS_SRC],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
         pytest.fail(f"asl アセンブル失敗\n{result.stdout}\n{result.stderr}")
 
     result = subprocess.run(
-        ["p2bin", p_file, bin_file, "-r", "$e900-$f2ff"],
+        ["p2bin", p_file, bin_file, "-r", memmap.bios_p2bin_range()],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -89,10 +89,10 @@ def _load_bios(pc: PC8001) -> None:
 def _make_sd_image() -> bytearray:
     """
     テスト用SDイメージを作成する。
-      LBA 5-8  (CCP):  各ブロック全バイト = 0xC0, 0xC1, 0xC2, 0xC3
-      LBA 9-15 (BDOS): 各ブロック全バイト = 0xD0, 0xD1, ..., 0xD6
-      CCPの先頭バイト(LBA5の先頭)は HALT(0x76) にする:
-        WBOOT後にCCP(0xD300)へJPするので、CCPの先頭がHALTなら
+      LBA 7-10 (CCP):  各ブロック全バイト = 0xC0, 0xC1, 0xC2, 0xC3
+      LBA 11-17(BDOS): 各ブロック全バイト = 0xD0, 0xD1, ..., 0xD6
+      CCPの先頭バイト(LBA7の先頭)は HALT(0x76) にする:
+        WBOOT後にCCP(0xCF00)へJPするので、CCPの先頭がHALTなら
         run_until_haltが正常に返る。
     """
     image = bytearray(256 * BLOCK_SIZE)
@@ -164,8 +164,8 @@ class TestWbootLoad:
 
     def test_wboot_ccp_placed(self):
         """
-        WBOOT 実行後、CCP ダミー(LBA5 パターン)が 0xD300 に配置される。
-        LBA5 先頭バイトは HALT(0x76)。
+        WBOOT 実行後、CCP ダミー(LBA7 パターン)が 0xCF00 に配置される。
+        LBA7 先頭バイトは HALT(0x76)。
         """
         pc, sd = setup_wboot_env()
         # WBOOT を set_pc で直接実行 (スタック設定済み)
@@ -175,21 +175,21 @@ class TestWbootLoad:
         halted = pc.run_until_halt(max_steps=5000000)
         assert halted, "WBOOT: HALT に到達しなかった"
 
-        # CCP先頭(0xD300)はHALT(0x76)
+        # CCP先頭(0xCF00)はHALT(0x76)
         val = pc._mem_read(CCP_ADDR)
-        assert val == 0x76, f"CCP先頭 0xD300={val:#04x} (expected 0x76 HALT)"
+        assert val == 0x76, f"CCP先頭 0xCF00={val:#04x} (expected 0x76 HALT)"
 
-        # LBA5の2バイト目以降は 0xC0 パターン
+        # LBA7の2バイト目以降は 0xC0 パターン
         val2 = pc._mem_read(CCP_ADDR + 1)
-        assert val2 == 0xC0, f"CCP 0xD301={val2:#04x} (expected 0xC0)"
+        assert val2 == 0xC0, f"CCP 0xCF01={val2:#04x} (expected 0xC0)"
 
-        # LBA6 先頭(0xD500)は 0xC1
+        # LBA8 先頭(0xCF00+512=0xD100)は 0xC1
         val3 = pc._mem_read(CCP_ADDR + BLOCK_SIZE)
-        assert val3 == 0xC1, f"CCP LBA6先頭 0xD500={val3:#04x} (expected 0xC1)"
+        assert val3 == 0xC1, f"CCP LBA8先頭 0xD100={val3:#04x} (expected 0xC1)"
 
     def test_wboot_bdos_placed(self):
         """
-        WBOOT 実行後、BDOS ダミー(LBA9 パターン)が 0xDB00 に配置される。
+        WBOOT 実行後、BDOS ダミー(LBA11 パターン)が 0xD700 に配置される。
         """
         pc, sd = setup_wboot_env()
         pc.cpu.sp = 0xDF00
@@ -198,17 +198,17 @@ class TestWbootLoad:
         halted = pc.run_until_halt(max_steps=5000000)
         assert halted, "WBOOT: HALT に到達しなかった"
 
-        # BDOS先頭(0xDB00): LBA9パターン 0xD0
+        # BDOS先頭(0xD700): LBA11パターン 0xD0
         val = pc._mem_read(BDOS_ADDR)
-        assert val == 0xD0, f"BDOS先頭 0xDB00={val:#04x} (expected 0xD0)"
+        assert val == 0xD0, f"BDOS先頭 0xD700={val:#04x} (expected 0xD0)"
 
-        # LBA10の先頭(0xDB00+512=0xDD00): 0xD1
+        # LBA12の先頭(0xD700+512=0xD900): 0xD1
         val2 = pc._mem_read(BDOS_ADDR + BLOCK_SIZE)
-        assert val2 == 0xD1, f"BDOS LBA10先頭 0xDD00={val2:#04x} (expected 0xD1)"
+        assert val2 == 0xD1, f"BDOS LBA12先頭 0xD900={val2:#04x} (expected 0xD1)"
 
     def test_wboot_ccp_all_blocks(self):
         """
-        CCP 全4ブロック(LBA5-8)の先頭バイトパターン確認。
+        CCP 全4ブロック(LBA7-10)の先頭バイトパターン確認。
         """
         pc, sd = setup_wboot_env()
         pc.cpu.sp = 0xDF00
@@ -216,7 +216,7 @@ class TestWbootLoad:
         pc.set_pc(WBOOT_ADDR)
         pc.run_until_halt(max_steps=5000000)
 
-        patterns = [0xC1, 0xC2, 0xC3]  # LBA6-8 (LBA5先頭はHALT)
+        patterns = [0xC1, 0xC2, 0xC3]  # LBA8-10 (LBA7先頭はHALT)
         for i, pat in enumerate(patterns):
             addr = CCP_ADDR + (i + 1) * BLOCK_SIZE
             val = pc._mem_read(addr)
@@ -227,7 +227,7 @@ class TestWbootLoad:
 
     def test_wboot_bdos_all_blocks(self):
         """
-        BDOS 全7ブロック(LBA9-15)の先頭バイトパターン確認。
+        BDOS 全7ブロック(LBA11-17)の先頭バイトパターン確認。
         """
         pc, sd = setup_wboot_env()
         pc.cpu.sp = 0xDF00
@@ -254,7 +254,7 @@ class TestWbootZeroPage:
 
     def test_zero_page_wboot_vector(self):
         """
-        WBOOT 後、0x0000-0x0002 が JP 0xE903 (WBOOT) になっている。
+        WBOOT 後、0x0000-0x0002 が JP 0xE503 (WBOOT) になっている。
         ゼロページはバンクRAM(拡張RAM)にあるため、e2=0x11でアクセスする。
         """
         pc, sd = setup_wboot_env()
@@ -272,7 +272,7 @@ class TestWbootZeroPage:
 
     def test_zero_page_bdos_vector(self):
         """
-        WBOOT 後、0x0005-0x0007 が JP 0xDB06 (BDOS エントリ) になっている。
+        WBOOT 後、0x0005-0x0007 が JP 0xD706 (BDOS エントリ) になっている。
         ゼロページはバンクRAM(拡張RAM)にあるため、e2=0x11でアクセスする。
         """
         pc, sd = setup_wboot_env()
@@ -341,9 +341,9 @@ class TestRst7Stub:
         _load_bios(pc)
         # e2=0x11 で拡張RAM書込を有効化
         pc.e2 = 0x11
-        # BOOT は最後に JP 0xD300(CCP) へジャンプするので、0xD300 に HALT を置く
+        # BOOT は最後に JP 0xCF00(CCP) へジャンプするので、0xCF00 に HALT を置く
         pc.load(CCP_ADDR, bytes([0x76]))
-        # BOOT (0xE900) を実行 → CCP の HALT で停止
+        # BOOT (0xE500) を実行 → CCP の HALT で停止
         pc.set_pc(BIOS_ORG)
         halted = pc.run_until_halt(max_steps=200000)
         assert halted, "BOOT: HALT に到達しなかった"
@@ -401,11 +401,11 @@ class TestWbootWorkInit:
 # ---------------------------------------------------------------
 
 class TestWbootJumpToCcp:
-    """WBOOT 実行後に CCP(0xD300) へジャンプすることを確認する。"""
+    """WBOOT 実行後に CCP(0xCF00) へジャンプすることを確認する。"""
 
     def test_wboot_jumps_to_ccp(self):
         """
-        WBOOT 実行後、CCP(0xD300) の先頭バイト(HALT=0x76)で停止する。
+        WBOOT 実行後、CCP(0xCF00) の先頭バイト(HALT=0x76)で停止する。
         CCP ダミーの先頭を HALT にしているので、run_until_halt が返る。
         """
         pc, sd = setup_wboot_env()
@@ -413,13 +413,13 @@ class TestWbootJumpToCcp:
         pc.cpu.halted = False
         pc.set_pc(WBOOT_ADDR)
         halted = pc.run_until_halt(max_steps=5000000)
-        assert halted, "WBOOT: CCP(0xD300)のHALTに到達しなかった"
+        assert halted, "WBOOT: CCP(0xCF00)のHALTに到達しなかった"
 
-        # HALT 到達後、PC は CCP 先頭 (0xD300) 付近のはず
-        # CCP先頭(0xD300) に HALT が書かれていることを確認
+        # HALT 到達後、PC は CCP 先頭 (0xCF00) 付近のはず
+        # CCP先頭(0xCF00) に HALT が書かれていることを確認
         val = pc._mem_read(CCP_ADDR)
         assert val == 0x76, (
-            f"CCP先頭 0xD300={val:#04x} (expected HALT 0x76)"
+            f"CCP先頭 0xCF00={val:#04x} (expected HALT 0x76)"
         )
 
 

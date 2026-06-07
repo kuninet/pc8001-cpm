@@ -27,7 +27,7 @@ from sd_tool import (
     SD_BLOCK, CPM_BLOCK_SIZE, DRIVE_BLOCKS, NUM_DRIVES,
     OFF_SECTORS, DIR_CPM_BLOCKS, DIR_SIZE, DIR_ENTRY_SIZE, DIR_ENTRIES,
     EMPTY_ENTRY, DSM, EXTENT_BLOCKS, EXTENT_SIZE, EXTENT_RECORDS,
-    SYS_LAYOUT, SYS_TOTAL_BLOCKS,
+    make_sys_layout, DEFAULT_BIOS_BLOCKS, SYS_CCP_BLOCKS, SYS_BDOS_BLOCKS,
     # ヘルパ関数
     extent_no, extent_to_fields,
     normalize_name, parse_name_arg, parse_drive,
@@ -113,9 +113,9 @@ class TestSys:
         img_path = _make_temp_image(tmp_path)
 
         # ダミーバイナリ(各レイアウトに合わせたサイズ)
-        bios_size = 5 * SD_BLOCK  # 2560B
-        ccp_size  = 4 * SD_BLOCK  # 2048B
-        bdos_size = 7 * SD_BLOCK  # 3584B
+        bios_size = DEFAULT_BIOS_BLOCKS * SD_BLOCK
+        ccp_size  = SYS_CCP_BLOCKS * SD_BLOCK   # 2048B
+        bdos_size = SYS_BDOS_BLOCKS * SD_BLOCK  # 3584B
 
         bios_bin = str(tmp_path / 'bios.bin')
         ccp_bin  = str(tmp_path / 'ccp.bin')
@@ -132,7 +132,7 @@ class TestSys:
         return load_image(img_path), bios_bin, ccp_bin, bdos_bin
 
     def test_bios_at_lba0(self, tmp_path):
-        """BIOS(LBA 0-4)がドライブAのOFF先頭に書かれていること。"""
+        """BIOS(LBA 0..N-1)がドライブAのOFF先頭に書かれていること。"""
         image, bios_bin, _, _ = self._write_and_load(tmp_path)
         with open(bios_bin, 'rb') as f:
             expected = f.read()
@@ -140,28 +140,29 @@ class TestSys:
         actual = bytes(image[base:base + len(expected)])
         assert actual == expected
 
-    def test_ccp_at_lba5(self, tmp_path):
-        """CCP(LBA 5-8)が正しい位置に書かれていること。"""
+    def test_ccp_at_sys_lba(self, tmp_path):
+        """CCP(LBA N..N+3)が正しい位置に書かれていること。"""
         image, _, ccp_bin, _ = self._write_and_load(tmp_path)
         with open(ccp_bin, 'rb') as f:
             expected = f.read()
-        base = drive_base_offset(0) + 5 * SD_BLOCK
+        base = drive_base_offset(0) + DEFAULT_BIOS_BLOCKS * SD_BLOCK
         actual = bytes(image[base:base + len(expected)])
         assert actual == expected
 
-    def test_bdos_at_lba9(self, tmp_path):
-        """BDOS(LBA 9-15)が正しい位置に書かれていること。"""
+    def test_bdos_at_sys_lba(self, tmp_path):
+        """BDOS(LBA N+4..N+10)が正しい位置に書かれていること。"""
         image, _, _, bdos_bin = self._write_and_load(tmp_path)
         with open(bdos_bin, 'rb') as f:
             expected = f.read()
-        base = drive_base_offset(0) + 9 * SD_BLOCK
+        base = drive_base_offset(0) + (DEFAULT_BIOS_BLOCKS + SYS_CCP_BLOCKS) * SD_BLOCK
         actual = bytes(image[base:base + len(expected)])
         assert actual == expected
 
     def test_sys_layout_total(self, tmp_path):
-        """SYS_TOTAL_BLOCKS(=16)×512B の範囲が有効であること。"""
+        """システム領域(BIOS_BLOCKS+CCP+BDOS)×512B が OFF領域に収まること。"""
         image, bios_bin, ccp_bin, bdos_bin = self._write_and_load(tmp_path)
-        total_written = SYS_TOTAL_BLOCKS * SD_BLOCK
+        sys_total = DEFAULT_BIOS_BLOCKS + SYS_CCP_BLOCKS + SYS_BDOS_BLOCKS
+        total_written = sys_total * SD_BLOCK
         # ドライブAのOFF領域(16KB)内に収まっていること
         assert total_written <= OFF_SECTORS * SD_BLOCK
 
@@ -172,7 +173,7 @@ class TestSys:
         ccp_bin  = str(tmp_path / 'ccp.bin')
         bdos_bin = str(tmp_path / 'bdos.bin')
         with open(bios_bin, 'wb') as f:
-            f.write(b'\xBB' * (5 * SD_BLOCK))
+            f.write(b'\xBB' * (7 * SD_BLOCK))
         with open(ccp_bin, 'wb') as f:
             f.write(b'\xCC' * (4 * SD_BLOCK))
         with open(bdos_bin, 'wb') as f:
