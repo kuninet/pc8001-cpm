@@ -339,11 +339,18 @@ class TestDummyRoutines:
         self._call_and_halt(pc, vec(14))
         assert pc.cpu.a == 1, f"WRITE: A=0x{pc.cpu.a:02X} (expected 0x01)"
 
-    def test_seldsk_returns_invalid(self, pc_with_bios):
-        """SELDSK(vec9=0xE91B): C=0 で選択しても HL==0(雛形は常に無効)。"""
+    def test_seldsk_valid_drive(self, pc_with_bios):
+        """SELDSK(vec9=0xE91B): C=0 で HL != 0 (DPH アドレスを返す)。"""
         pc = pc_with_bios
         # 0E 00  LD C, 0  → CALL SELDSK
         self._call_and_halt(pc, vec(9), prefix=bytes([0x0E, 0x00]))
+        assert pc.cpu.hl != 0, f"SELDSK: HL=0x{pc.cpu.hl:04X} (expected non-zero DPH addr)"
+
+    def test_seldsk_invalid_drive(self, pc_with_bios):
+        """SELDSK(vec9=0xE91B): C=8(範囲外) で HL==0(無効)。"""
+        pc = pc_with_bios
+        # 0E 08  LD C, 8  → CALL SELDSK
+        self._call_and_halt(pc, vec(9), prefix=bytes([0x0E, 0x08]))
         assert pc.cpu.hl == 0, f"SELDSK: HL=0x{pc.cpu.hl:04X} (expected 0x0000)"
 
 

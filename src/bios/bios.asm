@@ -670,52 +670,669 @@ READER:
 	LD	A, 1Ah
 	RET
 
+SIGNON:
+	DB	'PC-8001 CP/M 2.2 BIOS', 0
+
+; カーソル位置 (行0-24, 列0-79)
+CUR_ROW:
+	DB	0
+CUR_COL:
+	DB	0
+
+; ESC シーケンス状態 (0=通常, 1=ESC受信, 2=row待ち, 3=col待ち)
+ESC_STATE:
+	DB	0
+
+; キー入力1文字バッファ (0=空, それ以外=有効文字)
+KEYBUF:
+	DB	0
+
+;==============================================================
+; SDブロックドライバ(#33)固定ジャンプテーブル
+;   SD_INIT_VEC  = 0EC00h  (CALL 0EC00h でSD初期化)
+;   SD_READ_VEC  = 0EC03h  (CALL 0EC03h でブロック読込)
+;   SD_WRITE_VEC = 0EC06h  (CALL 0EC06h でブロック書込)
+;==============================================================
+	org	0EC00h
+
+SD_INIT_VEC:
+	JP	SD_INIT		; 0: SD初期化
+SD_READ_VEC:
+	JP	SD_READ_BLOCK	; 3: ブロック読込
+SD_WRITE_VEC:
+	JP	SD_WRITE_BLOCK	; 6: ブロック書込
+
+;==============================================================
+; SDブロックドライバ実装
+;   8255 ポート割当 (SD-DOS互換):
+;     PA=0xFC, PB=0xFD, PC=0xFE, CTL=0xFF
+;     制御ワード = 0x88 (MODE0/A=IN/B=OUT/CH=IN/CL=OUT)
+;     PB bit0=CLK, bit1=MOSI, bit2=CS(負論理), bit3=LED
+;     PC bit4=MISO
+;==============================================================
+
 ;--------------------------------------------------------------
-; HOME: トラック0シーク (ダミー)
+; SD_INIT_PORTS: 8255初期化
+;   CTLに0x88設定、PBを0xFF(CS=High, CLK=High, MOSI=High, LED=High)
+;--------------------------------------------------------------
+SD_INIT_PORTS:
+	LD	A, 88h
+	OUT	(0FFh), A		; 8255制御ワード設定
+	LD	A, 0FFh
+	OUT	(0FDh), A		; PB初期値(CS=High)
+	RET
+
+;--------------------------------------------------------------
+; SD_CS_LOW: CS をアサート(bit2=0)
+;--------------------------------------------------------------
+SD_CS_LOW:
+	IN	A, (0FDh)
+	AND	11111011B		; bit2=0(CSアサート)
+	OUT	(0FDh), A
+	RET
+
+;--------------------------------------------------------------
+; SD_CS_HIGH: CS をネゲート(bit2=1)
+;--------------------------------------------------------------
+SD_CS_HIGH:
+	IN	A, (0FDh)
+	OR	00000100B		; bit2=1(CSネゲート)
+	OUT	(0FDh), A
+	RET
+
+;--------------------------------------------------------------
+; SD_SPI_OUT: 1バイト送受信(MSBファースト, SPI mode0)
+;   入力: C = 送信バイト
+;   出力: A = 受信バイト, D = 受信バイト(コピー)
+;   破壊: AF, D
+;   保存: BC, HL (PUSH/POP)
+;   注意: CS=0 を維持したまま呼ぶこと
+;--------------------------------------------------------------
+SD_SPI_OUT:
+	PUSH	BC
+	PUSH	HL
+	; ベース値をLに格納: CS/LED現在値を保持してCLK=0, MOSI=0
+	IN	A, (0FDh)
+	AND	11111100B		; CLK=0, MOSI=0 クリア(CS/LEDは保持)
+	LD	L, A			; L = ベース値(CS=0, LED=1保持)
+	LD	D, 0			; D = 受信シフトレジスタ
+	LD	H, 8			; H = ビットカウンタ
+SPI_OUT_LOOP:
+	; MOSI bit設定: CのMSBをbit1へ(SLAでCYに取り出す)
+	LD	A, L
+	AND	11111101B		; MOSI=0クリア
+	SLA	C			; MSBをCYへ, C左シフト(LSB=0)
+	JR	NC, SPI_OUT_CLK0	; CY=0: MOSI=0
+	OR	00000010B		; CY=1: MOSI=1
+SPI_OUT_CLK0:
+	; CLK=0 で書き出す(CLKはベース値で既に0)
+	OUT	(0FDh), A
+	LD	L, A			; L更新(MOSI含む)
+	; CLK立上り
+	OR	00000001B		; CLK=1
+	OUT	(0FDh), A
+	; MISO読み取り(CLK=1の後)
+	SLA	D			; D左シフト(LSB=0)
+	IN	A, (0FEh)
+	AND	00010000B		; bit4=MISO, ZF: MISO=0ならZ
+	JR	Z, SPI_OUT_MISO0	; MISO=0: Dのbit0=0のまま
+	INC	D			; MISO=1: D.bit0=1
+SPI_OUT_MISO0:
+	; CLK立下り
+	LD	A, L
+	AND	11111110B		; CLK=0
+	OUT	(0FDh), A
+	LD	L, A			; L更新
+	DEC	H
+	JR	NZ, SPI_OUT_LOOP
+	LD	A, D			; 受信バイトをAに
+	POP	HL
+	POP	BC
+	RET
+
+;--------------------------------------------------------------
+; SD_SPI_IN: 0xFFを送って1バイト受信
+;   出力: A = 受信バイト
+;   保存: BC (LD C,0FFh で C を書き換えるので PUSH/POP で保護)
+;--------------------------------------------------------------
+SD_SPI_IN:
+	PUSH	BC
+	LD	C, 0FFh
+	CALL	SD_SPI_OUT
+	POP	BC
+	RET
+
+;--------------------------------------------------------------
+; SD_SEND_CMD: コマンドフレーム送信
+;   入力: HL = 6バイトコマンド構造体ポインタ
+;         (cmd|0x40, arg3, arg2, arg1, arg0, crc)
+;   破壊: AF, B, C, D, H, HL
+;--------------------------------------------------------------
+SD_SEND_CMD:
+	LD	B, 6			; 6バイト送信
+SEND_CMD_LOOP:
+	LD	C, (HL)
+	CALL	SD_SPI_OUT
+	INC	HL
+	DJNZ	SEND_CMD_LOOP
+	RET
+
+
+;--------------------------------------------------------------
+; SD_INIT: SD カード初期化
+;   出力: CY=0 成功 / CY=1 失敗
+;   破壊: AF, BC, DE, HL
+;--------------------------------------------------------------
+SD_INIT:
+	CALL	SD_INIT_PORTS
+
+	; CS=High で 0xFF を 10回送信(74クロック以上のダミー)
+	LD	B, 10
+SD_INIT_DUMMY:
+	CALL	SD_SPI_IN
+	DJNZ	SD_INIT_DUMMY
+
+	; CS=Low
+	CALL	SD_CS_LOW
+
+	; CMD0送信(GO_IDLE_STATE, CRC=0x95)
+	LD	HL, SD_CMD0
+	CALL	SD_SEND_CMD
+	; R1ポーリング: 0x01を期待
+	CALL	SD_POLL_R1
+	JR	C, SD_INIT_FAIL		; タイムアウト
+	CP	01h
+	JR	NZ, SD_INIT_FAIL	; R1≠0x01
+
+	; CMD8送信(SEND_IF_COND, arg=0x000001AA, CRC=0x87)
+	LD	HL, SD_CMD8
+	CALL	SD_SEND_CMD
+	; R1ポーリング: 0x01を期待
+	CALL	SD_POLL_R1
+	JR	C, SD_INIT_FAIL
+	CP	01h
+	JR	NZ, SD_INIT_FAIL
+	; R7 4バイト受信: 最後のバイトが0xAAか確認
+	CALL	SD_SPI_IN		; R7[0]
+	CALL	SD_SPI_IN		; R7[1]
+	CALL	SD_SPI_IN		; R7[2]
+	CALL	SD_SPI_IN		; R7[3] → A
+	CP	0AAh
+	JR	NZ, SD_INIT_FAIL
+
+	; ACMD41ループ(最大256回)
+	LD	B, 0			; Bカウンタ(0=256回)
+SD_ACMD41_LOOP:
+	; CMD55
+	LD	HL, SD_CMD55
+	CALL	SD_SEND_CMD
+	CALL	SD_POLL_R1
+	JR	C, SD_INIT_FAIL
+	; ACMD41(arg=0x40000000)
+	LD	HL, SD_CMD41
+	CALL	SD_SEND_CMD
+	CALL	SD_POLL_R1
+	JR	C, SD_INIT_FAIL
+	CP	00h
+	JR	Z, SD_ACMD41_DONE	; R1==0x00: 初期化完了
+	DJNZ	SD_ACMD41_LOOP
+	JR	SD_INIT_FAIL		; タイムアウト
+
+SD_ACMD41_DONE:
+	; CMD58(READ_OCR)
+	LD	HL, SD_CMD58
+	CALL	SD_SEND_CMD
+	CALL	SD_POLL_R1
+	JR	C, SD_INIT_FAIL
+	CP	00h
+	JR	NZ, SD_INIT_FAIL
+	; OCR 4バイト受信: 先頭バイトのbit6=CCS
+	CALL	SD_SPI_IN		; OCR[0]
+	PUSH	AF			; OCR[0]保存
+	CALL	SD_SPI_IN		; OCR[1]
+	CALL	SD_SPI_IN		; OCR[2]
+	CALL	SD_SPI_IN		; OCR[3]
+	POP	AF			; OCR[0]
+	AND	40h			; bit6=CCS
+	LD	(SD_CCS), A		; CCS保存(非0=SDHC)
+
+	; CCS=0ならCMD16でブロック長512設定
+	JR	NZ, SD_INIT_OK		; CCS≠0(SDHC): スキップ
+	LD	HL, SD_CMD16
+	CALL	SD_SEND_CMD
+	CALL	SD_POLL_R1
+	; CMD16失敗は無視(v1カードがない場合)
+
+SD_INIT_OK:
+	CALL	SD_CS_HIGH
+	OR	A			; CY=0
+	CCF				; CY=0確定(OR Aでクリアされているため不要だが明示)
+	XOR	A			; A=0, CY=0
+	RET
+
+SD_INIT_FAIL:
+	CALL	SD_CS_HIGH
+	SCF				; CY=1
+	RET
+
+;--------------------------------------------------------------
+; SD_POLL_R1: R1レスポンスをポーリング取得
+;   最大16回試行、MSB=0のバイトを返す
+;   出力: A = R1, CY=0 成功 / A=0xFF, CY=1 タイムアウト
+;   破壊: AF
+;--------------------------------------------------------------
+SD_POLL_R1:
+	PUSH	BC
+	LD	B, 16
+SD_PR1_LOOP:
+	CALL	SD_SPI_IN
+	BIT	7, A
+	JR	Z, SD_PR1_OK		; bit7=0: 有効なR1
+	DJNZ	SD_PR1_LOOP
+	; タイムアウト
+	POP	BC
+	LD	A, 0FFh
+	SCF				; CY=1
+	RET
+SD_PR1_OK:
+	POP	BC
+	OR	A			; CY=0
+	RET
+
+;--------------------------------------------------------------
+; SD_READ_BLOCK: ブロック読込
+;   入力: DE:HL = LBA(DE=上位16bit, HL=下位16bit)
+;   出力: CY=0 成功(データはSD_BUFへ) / CY=1 失敗
+;   破壊: AF, BC, HL
+;--------------------------------------------------------------
+SD_READ_BLOCK:
+	; LBAをコマンドバッファに書き込む (IX使用)
+	PUSH	IX
+	LD	IX, SD_RD_ARG
+	LD	(IX+0), D		; arg[0]=LBA上位上位
+	LD	(IX+1), E		; arg[1]=LBA上位下位
+	LD	(IX+2), H		; arg[2]=LBA下位上位
+	LD	(IX+3), L		; arg[3]=LBA下位下位
+	POP	IX
+
+	CALL	SD_CS_LOW
+
+	; CMD17(READ_SINGLE_BLOCK)送信
+	LD	HL, SD_CMD17
+	CALL	SD_SEND_CMD
+	; R1チェック
+	CALL	SD_POLL_R1
+	JR	C, SD_RB_FAIL
+	CP	00h
+	JR	NZ, SD_RB_FAIL
+
+	; データトークン 0xFE を待つ(最大64回)
+	LD	B, 64
+SD_RB_TOKEN_WAIT:
+	CALL	SD_SPI_IN
+	CP	0FEh
+	JR	Z, SD_RB_DATA		; トークン受信
+	DJNZ	SD_RB_TOKEN_WAIT
+	JR	SD_RB_FAIL		; タイムアウト
+
+SD_RB_DATA:
+	; 512バイト受信 → SD_BUFへ
+	; アドレス比較でループ終端判定(BC使用回避: SD_SPI_INがCを変更するため)
+	LD	HL, SD_BUF		; HL = 0xEE00
+SD_RB_RECV_LOOP:
+	CALL	SD_SPI_IN
+	LD	(HL), A
+	INC	HL
+	; HL == 0xF000(SD_BUF+512) になったら終了
+	LD	A, H
+	CP	0F0h
+	JR	NZ, SD_RB_RECV_LOOP
+
+	; CRC 2バイト読み捨て
+	CALL	SD_SPI_IN
+	CALL	SD_SPI_IN
+
+	CALL	SD_CS_HIGH
+	XOR	A			; CY=0
+	RET
+
+SD_RB_FAIL:
+	CALL	SD_CS_HIGH
+	SCF				; CY=1
+	RET
+
+;--------------------------------------------------------------
+; SD_WRITE_BLOCK: ブロック書込
+;   入力: DE:HL = LBA, データソースはSD_BUF
+;   出力: CY=0 成功 / CY=1 失敗
+;   破壊: AF, BC, HL
+;--------------------------------------------------------------
+SD_WRITE_BLOCK:
+	; LBAをコマンドバッファに書き込む (IX使用)
+	PUSH	IX
+	LD	IX, SD_WR_ARG
+	LD	(IX+0), D
+	LD	(IX+1), E
+	LD	(IX+2), H
+	LD	(IX+3), L
+	POP	IX
+
+	CALL	SD_CS_LOW
+
+	; CMD24(WRITE_SINGLE_BLOCK)送信
+	LD	HL, SD_CMD24
+	CALL	SD_SEND_CMD
+	; R1チェック
+	CALL	SD_POLL_R1
+	JR	C, SD_WB_FAIL
+	CP	00h
+	JR	NZ, SD_WB_FAIL
+
+	; データトークン 0xFE 送信
+	LD	C, 0FEh
+	CALL	SD_SPI_OUT
+
+	; SD_BUFから512バイト送信
+	; アドレス比較でループ終端判定(BCカウンタ回避: LD C,(HL)がCを変更するため)
+	LD	HL, SD_BUF		; HL = 0xEE00
+SD_WB_SEND_LOOP:
+	LD	C, (HL)
+	CALL	SD_SPI_OUT
+	INC	HL
+	; HL == 0xF000(SD_BUF+512) になったら終了
+	LD	A, H
+	CP	0F0h
+	JR	NZ, SD_WB_SEND_LOOP
+
+	; CRC 2バイト送信(ダミー)
+	LD	C, 00h
+	CALL	SD_SPI_OUT
+	LD	C, 00h
+	CALL	SD_SPI_OUT
+
+	; データレスポンス受信(下位5bit=0b00101確認)
+	CALL	SD_POLL_R1		; データレスポンスをポーリング
+	JR	C, SD_WB_FAIL
+	AND	1Fh			; 下位5bit
+	CP	05h			; 0b00101 = accepted
+	JR	NZ, SD_WB_FAIL
+
+	; busy待ち(0xFFが来るまで最大256回)
+	LD	B, 0
+SD_WB_BUSY_WAIT:
+	CALL	SD_SPI_IN
+	CP	0FFh
+	JR	Z, SD_WB_OK
+	DJNZ	SD_WB_BUSY_WAIT
+	JR	SD_WB_FAIL
+
+SD_WB_OK:
+	CALL	SD_CS_HIGH
+	XOR	A			; CY=0
+	RET
+
+SD_WB_FAIL:
+	CALL	SD_CS_HIGH
+	SCF				; CY=1
+	RET
+
+;--------------------------------------------------------------
+; SDコマンドフレームテーブル
+;--------------------------------------------------------------
+SD_CMD0:
+	DB	40h, 00h, 00h, 00h, 00h, 95h	; CMD0: GO_IDLE_STATE
+
+SD_CMD8:
+	DB	48h, 00h, 00h, 01h, 0AAh, 87h	; CMD8: SEND_IF_COND (VHS=1, 0xAA)
+
+SD_CMD55:
+	DB	77h, 00h, 00h, 00h, 00h, 0FFh	; CMD55: APP_CMD
+
+SD_CMD41:
+	DB	69h, 40h, 00h, 00h, 00h, 0FFh	; ACMD41: SD_SEND_OP_COND(HCS=1)
+
+SD_CMD58:
+	DB	7Ah, 00h, 00h, 00h, 00h, 0FFh	; CMD58: READ_OCR
+
+SD_CMD16:
+	DB	50h, 00h, 00h, 02h, 00h, 0FFh	; CMD16: SET_BLOCKLEN 512
+
+SD_CMD17:
+	DB	51h			; CMD17: READ_SINGLE_BLOCK
+SD_RD_ARG:
+	DB	00h, 00h, 00h, 00h	; arg (動的書き換え)
+	DB	0FFh			; CRC
+
+SD_CMD24:
+	DB	58h			; CMD24: WRITE_SINGLE_BLOCK
+SD_WR_ARG:
+	DB	00h, 00h, 00h, 00h	; arg (動的書き換え)
+	DB	0FFh			; CRC
+
+;--------------------------------------------------------------
+; SD用データ領域 (固定アドレス 0xEE00)
+;--------------------------------------------------------------
+	org	0EE00h
+
+SD_BUF:
+	DS	512			; 512バイトブロックバッファ
+
+SD_CCS:
+	DB	0			; カード種別 (0=SDSC, 非0=SDHC)
+
+;==============================================================
+; ディスク層ワーク領域 (0xF001 以降, SD_CCS=0xF000の直後)
+;==============================================================
+	org	0F001h
+
+CUR_DISK:
+	DB	0FFh			; 選択中ドライブ(0=A〜7=H, 0xFF=未選択)
+
+CUR_TRACK:
+	DW	0			; 現在のトラック番号(16bit)
+
+CUR_SECTOR:
+	DW	0			; 現在のセクタ番号(16bit)
+
+CUR_DMA:
+	DW	0080h			; DMAバッファアドレス(CP/M標準0x0080)
+
+BUF_LBA:
+	DB	0FFh, 0FFh, 0FFh, 0FFh	; バッファ内LBA(0xFFFFFFFF=無効)
+
+BUF_DIRTY:
+	DB	0			; 0=clean, 非0=dirty
+
+WRITE_TYPE:
+	DB	0			; 書込タイプ退避
+
+REC_DIV4:
+	DW	0			; CALC_LBA内部ワーク(rec>>2)
+
+DISK_LBA_TMP:
+	DS	4			; ENSURE_BUF内部ワーク(目標LBA)
+
+;==============================================================
+; DPB共通 (15バイト, 固定アドレス 0xF020)
+; ワーク領域終端 0xF013 の後、パディングを挟んで 0xF020 に配置
+; SPT=64, BSH=4, BLM=15, EXM=0, DSM=1023, DRM=511,
+; AL0=0xFF, AL1=0x00, CKS=0, OFF=2
+;==============================================================
+	org	0F020h
+
+DPB_COMMON:
+	DW	64			; SPT: 1トラックのレコード数
+	DB	4			; BSH: ブロックシフト(2KB)
+	DB	15			; BLM: ブロックマスク
+	DB	0			; EXM: エクステントマスク
+	DW	1023			; DSM: 最大ブロック番号(1024ブロック)
+	DW	511			; DRM: ディレクトリエントリ最大数
+	DB	0FFh			; AL0: ディレクトリ用ブロック割当(上位)
+	DB	00h			; AL1: ディレクトリ用ブロック割当(下位)
+	DW	0			; CKS: チェックサム(固定ディスク=0)
+	DW	2			; OFF: システム予約トラック数
+
+;==============================================================
+; DIRBUF共通 (128バイト, 固定アドレス 0xF030)
+; DPB 15B: 0xF020-0xF02E → DIRBUF開始は 0xF030 (1バイトパディング)
+;==============================================================
+	org	0F030h
+
+DIRBUF:
+	DS	128			; ディレクトリバッファ
+
+;==============================================================
+; DPHテーブル (8ドライブ×16バイト = 128バイト, 0xF0B0)
+; DIRBUF 128B: 0xF030-0xF0AF → DPHテーブル開始は 0xF0B0
+; 各DPH構成:
+;   XLT   (2B) = 0      (恒等変換のためNULL)
+;   000000(6B)           (予約0)
+;   DIRBUF(2B) = DIRBUF
+;   DPB   (2B) = DPB_COMMON
+;   CSV   (2B) = 0      (CKS=0のためNULL)
+;   ALV   (2B) = 0      (テスト用省略; BDOSはCKS=0時ALVも省略可)
+;==============================================================
+	org	0F0B0h
+
+DPH_TABLE:
+DPH0:	DW	0		; XLT
+	DW	0,0,0		; 予約6バイト
+	DW	DIRBUF		; DIRBUF
+	DW	DPB_COMMON	; DPB
+	DW	0		; CSV
+	DW	0		; ALV
+
+DPH1:	DW	0
+	DW	0,0,0
+	DW	DIRBUF
+	DW	DPB_COMMON
+	DW	0
+	DW	0
+
+DPH2:	DW	0
+	DW	0,0,0
+	DW	DIRBUF
+	DW	DPB_COMMON
+	DW	0
+	DW	0
+
+DPH3:	DW	0
+	DW	0,0,0
+	DW	DIRBUF
+	DW	DPB_COMMON
+	DW	0
+	DW	0
+
+DPH4:	DW	0
+	DW	0,0,0
+	DW	DIRBUF
+	DW	DPB_COMMON
+	DW	0
+	DW	0
+
+DPH5:	DW	0
+	DW	0,0,0
+	DW	DIRBUF
+	DW	DPB_COMMON
+	DW	0
+	DW	0
+
+DPH6:	DW	0
+	DW	0,0,0
+	DW	DIRBUF
+	DW	DPB_COMMON
+	DW	0
+	DW	0
+
+DPH7:	DW	0
+	DW	0,0,0
+	DW	DIRBUF
+	DW	DPB_COMMON
+	DW	0
+	DW	0
+
+
+;==============================================================
+; ディスクBIOS実装 (固定アドレス 0xF130)
+;   ジャンプテーブルから直接参照される。
+;   SD区域(0xEC00-0xEDFF)/データ領域(0xF000-0xF12F)の
+;   どちらとも重複しない 0xF130 に配置する。
+;   DPHテーブル終端 0xF0B0+128=0xF130 に続けて配置。
+;   VRAMは 0xF300 から。コード領域約 0x1D0=464バイト。
+;==============================================================
+	org	0F130h
+
+;--------------------------------------------------------------
+; HOME: トラック0シーク
+;   dirtyバッファがあればフラッシュ後、CUR_TRACK=0
 ;--------------------------------------------------------------
 HOME:
+	PUSH	AF
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	LD	A, (BUF_DIRTY)
+	OR	A
+	CALL	NZ, DISK_FLUSH
+	XOR	A
+	LD	(CUR_TRACK), A
+	LD	(CUR_TRACK+1), A
+	POP	HL
+	POP	DE
+	POP	BC
+	POP	AF
 	RET
 
 ;--------------------------------------------------------------
 ; SELDSK: ディスク選択
-;   戻り: HL=0(無効)
+;   入力: C = ドライブ番号 (0=A〜7=H)
+;   戻り: HL = DPHアドレス(有効) / HL=0(無効)
 ;--------------------------------------------------------------
 SELDSK:
+	PUSH	AF
+	PUSH	DE
+	LD	A, C
+	CP	8
+	JR	NC, SELDSK_INV
+	LD	(CUR_DISK), A
+	LD	L, A
+	LD	H, 0
+	ADD	HL, HL		; ×2
+	ADD	HL, HL		; ×4
+	ADD	HL, HL		; ×8
+	ADD	HL, HL		; ×16 = A*16
+	LD	DE, DPH_TABLE
+	ADD	HL, DE		; HL = DPH_TABLE + A*16
+	JR	SELDSK_RET
+SELDSK_INV:
 	LD	HL, 0
+SELDSK_RET:
+	POP	DE
+	POP	AF
 	RET
 
 ;--------------------------------------------------------------
-; SETTRK: トラック設定 (ダミー)
+; SETTRK: トラック番号保存
+;   入力: BC = トラック番号
 ;--------------------------------------------------------------
 SETTRK:
+	LD	(CUR_TRACK), BC
 	RET
 
 ;--------------------------------------------------------------
-; SETSEC: セクタ設定 (ダミー)
+; SETSEC: セクタ番号保存
+;   入力: BC = セクタ番号
 ;--------------------------------------------------------------
 SETSEC:
+	LD	(CUR_SECTOR), BC
 	RET
 
 ;--------------------------------------------------------------
-; SETDMA: DMAアドレス設定 (ダミー)
+; SETDMA: DMAアドレス保存
+;   入力: BC = DMAバッファアドレス
 ;--------------------------------------------------------------
 SETDMA:
-	RET
-
-;--------------------------------------------------------------
-; READ: セクタ読込 (常にエラー)
-;   戻り: A=1
-;--------------------------------------------------------------
-READ:
-	LD	A, 1
-	RET
-
-;--------------------------------------------------------------
-; WRITE: セクタ書込 (常にエラー)
-;   戻り: A=1
-;--------------------------------------------------------------
-WRITE:
-	LD	A, 1
+	LD	(CUR_DMA), BC
 	RET
 
 ;--------------------------------------------------------------
@@ -737,24 +1354,272 @@ SECTRAN:
 	RET
 
 ;--------------------------------------------------------------
-; データ領域
+; READ: セクタ読込
+;   戻り: A=0(成功) / A=1(エラー)
 ;--------------------------------------------------------------
-SIGNON:
-	DB	'PC-8001 CP/M 2.2 BIOS', 0
+READ:
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	CALL	CALC_LBA		; DE:HL = LBA32, B = offset番号(0-3)
+	CALL	ENSURE_BUF		; バッファ確保。CY=1 で失敗
+	JR	C, DISK_ERR
+	CALL	READ_TO_DMA		; SD_BUF+offset*128 → CUR_DMA(128B)
+	XOR	A
+	POP	HL
+	POP	DE
+	POP	BC
+	RET
+DISK_ERR:
+	LD	A, 1
+	POP	HL
+	POP	DE
+	POP	BC
+	RET
 
-; カーソル位置 (行0-24, 列0-79)
-CUR_ROW:
-	DB	0
-CUR_COL:
-	DB	0
+;--------------------------------------------------------------
+; WRITE: セクタ書込
+;   入力: C = 書込タイプ (0=通常, 1=ディレクトリ, 2=未使用先頭)
+;   戻り: A=0(成功) / A=1(エラー)
+;--------------------------------------------------------------
+WRITE:
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	LD	A, C
+	LD	(WRITE_TYPE), A
+	CALL	CALC_LBA		; DE:HL = LBA32, B = offset番号(0-3)
+	CALL	ENSURE_BUF		; read-modify-write。CY=1 で失敗
+	JR	C, WRITE_ERR
+	CALL	WRITE_FROM_DMA		; CUR_DMA → SD_BUF+offset*128(128B)
+	LD	A, 1
+	LD	(BUF_DIRTY), A
+	LD	A, (WRITE_TYPE)
+	CP	1			; ディレクトリ書込なら即フラッシュ
+	JR	NZ, WRITE_OK
+	CALL	DISK_FLUSH
+	JR	C, WRITE_ERR
+WRITE_OK:
+	XOR	A
+	POP	HL
+	POP	DE
+	POP	BC
+	RET
+WRITE_ERR:
+	LD	A, 1
+	POP	HL
+	POP	DE
+	POP	BC
+	RET
 
-; ESC シーケンス状態 (0=通常, 1=ESC受信, 2=row待ち, 3=col待ち)
-ESC_STATE:
-	DB	0
+;--------------------------------------------------------------
+; CALC_LBA: 論理(track,sector)→物理(LBA32)計算
+;   使用ワーク: CUR_DISK, CUR_TRACK, CUR_SECTOR, REC_DIV4
+;   戻り:
+;     DE:HL = LBA32 (DE=上位16bit, HL=下位16bit)
+;     B     = rec & 3  (0..3, 128Bオフセット番号)
+;   破壊: AF, BC, DE, HL
+;
+;   計算:
+;     track_adj = CUR_TRACK + 2 (OFF=2)
+;     rec       = track_adj * 64 + CUR_SECTOR  (SPT=64)
+;     B         = rec & 3
+;     rec_div4  = rec >> 2
+;     lba       = d * 4128 + rec_div4
+;                 4128 = 0x1000 + 0x20
+;                 d(0-7): d*4128 <= 28896 = 0x70E0 (16bitに収まる)
+;--------------------------------------------------------------
+CALC_LBA:
+	; --- rec 計算 ---
+	LD	HL, (CUR_TRACK)
+	INC	HL
+	INC	HL			; HL = track + OFF(2)
+	ADD	HL, HL			; x2
+	ADD	HL, HL			; x4
+	ADD	HL, HL			; x8
+	ADD	HL, HL			; x16
+	ADD	HL, HL			; x32
+	ADD	HL, HL			; x64 → HL = track_adj * SPT
+	LD	A, (CUR_SECTOR)
+	ADD	A, L
+	LD	L, A
+	JR	NC, CLBA_NC
+	INC	H
+CLBA_NC:
+	; HL = rec
+	LD	A, L
+	AND	03h
+	LD	B, A			; B = rec & 3
+	SRL	H
+	RR	L
+	SRL	H
+	RR	L			; HL = rec_div4
+	LD	(REC_DIV4), HL		; 退避
 
-; キー入力1文字バッファ (0=空, それ以外=有効文字)
-KEYBUF:
-	DB	0
+	; --- d * 4128 = d * 0x1000 + d * 0x20 ---
+	LD	A, (CUR_DISK)
+	LD	H, A
+	LD	L, 0
+	ADD	HL, HL			; d*512
+	ADD	HL, HL			; d*1024
+	ADD	HL, HL			; d*2048
+	ADD	HL, HL			; d*4096 = d*0x1000
+	LD	A, (CUR_DISK)
+	LD	E, A
+	LD	D, 0
+	SLA	E
+	SLA	E
+	SLA	E
+	SLA	E
+	SLA	E			; E = d*32 = d*0x20 (d<=7, キャリーなし)
+	ADD	HL, DE			; HL = d*4128
 
-;==============================================================
-; SDブロックドライバ固定ジャンプテーブル
+	; --- lba = d*4128 + rec_div4 ---
+	LD	DE, (REC_DIV4)
+	ADD	HL, DE			; HL = lba (下位16bit)
+	LD	DE, 0
+	JR	NC, CLBA_NC2
+	INC	DE			; キャリーを上位へ
+CLBA_NC2:
+	; DE:HL = LBA32
+	RET
+
+;--------------------------------------------------------------
+; ENSURE_BUF: バッファ確保 (ミス時フラッシュ+SD読込)
+;   入力: DE:HL = 目標LBA, B = offset番号(0-3)
+;   出力: CY=0 成功 / CY=1 失敗, B変更なし
+;--------------------------------------------------------------
+ENSURE_BUF:
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	LD	(DISK_LBA_TMP), HL
+	LD	(DISK_LBA_TMP+2), DE
+	; BUF_LBA と比較 (4バイト一致でヒット)
+	LD	A, (BUF_LBA)
+	CP	L
+	JR	NZ, ENS_MISS
+	LD	A, (BUF_LBA+1)
+	CP	H
+	JR	NZ, ENS_MISS
+	LD	A, (BUF_LBA+2)
+	CP	E
+	JR	NZ, ENS_MISS
+	LD	A, (BUF_LBA+3)
+	CP	D
+	JR	Z, ENS_HIT
+ENS_MISS:
+	; ミス: dirtyならフラッシュ
+	LD	A, (BUF_DIRTY)
+	OR	A
+	JR	Z, ENS_LOAD
+	CALL	DISK_FLUSH
+	JR	C, ENS_FAIL
+ENS_LOAD:
+	LD	HL, (DISK_LBA_TMP)
+	LD	DE, (DISK_LBA_TMP+2)
+	CALL	SD_READ_BLOCK
+	JR	C, ENS_FAIL
+	; BUF_LBA 更新
+	LD	HL, (DISK_LBA_TMP)
+	LD	DE, (DISK_LBA_TMP+2)
+	LD	(BUF_LBA), HL
+	LD	(BUF_LBA+2), DE
+	XOR	A
+	LD	(BUF_DIRTY), A
+ENS_HIT:
+	POP	HL
+	POP	DE
+	POP	BC
+	OR	A			; CY=0
+	RET
+ENS_FAIL:
+	POP	HL
+	POP	DE
+	POP	BC
+	SCF				; CY=1
+	RET
+
+;--------------------------------------------------------------
+; DISK_FLUSH: 現在のバッファ(BUF_LBA)をSDに書き戻す
+;   出力: CY=0 成功 / CY=1 失敗, BUF_DIRTY=0(成功時)
+;--------------------------------------------------------------
+DISK_FLUSH:
+	PUSH	DE
+	PUSH	HL
+	LD	HL, (BUF_LBA)
+	LD	DE, (BUF_LBA+2)
+	CALL	SD_WRITE_BLOCK
+	JR	C, FLUSH_FAIL
+	XOR	A
+	LD	(BUF_DIRTY), A
+	POP	HL
+	POP	DE
+	OR	A			; CY=0
+	RET
+FLUSH_FAIL:
+	POP	HL
+	POP	DE
+	SCF				; CY=1
+	RET
+
+;--------------------------------------------------------------
+; READ_TO_DMA: SD_BUF+B*128 → CUR_DMA (128バイトコピー)
+;   入力: B = offset番号(0-3)
+;   破壊: AF, BC, DE, HL
+;--------------------------------------------------------------
+READ_TO_DMA:
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	; src = SD_BUF + B * 128
+	LD	H, 0
+	LD	L, B
+	ADD	HL, HL
+	ADD	HL, HL
+	ADD	HL, HL
+	ADD	HL, HL
+	ADD	HL, HL
+	ADD	HL, HL
+	ADD	HL, HL			; HL = B * 128
+	LD	DE, SD_BUF
+	ADD	HL, DE			; HL = SD_BUF + B*128 (src)
+	LD	DE, (CUR_DMA)		; DE = dst
+	LD	BC, 128
+	LDIR
+	POP	HL
+	POP	DE
+	POP	BC
+	RET
+
+;--------------------------------------------------------------
+; WRITE_FROM_DMA: CUR_DMA → SD_BUF+B*128 (128バイトコピー)
+;   入力: B = offset番号(0-3)
+;   破壊: AF, BC, DE, HL
+;--------------------------------------------------------------
+WRITE_FROM_DMA:
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	; dst = SD_BUF + B * 128
+	LD	H, 0
+	LD	L, B
+	ADD	HL, HL
+	ADD	HL, HL
+	ADD	HL, HL
+	ADD	HL, HL
+	ADD	HL, HL
+	ADD	HL, HL
+	ADD	HL, HL			; HL = B * 128
+	LD	DE, SD_BUF
+	ADD	HL, DE			; HL = SD_BUF + B*128 (dst)
+	EX	DE, HL			; DE = dst (SD_BUF+B*128)
+	LD	HL, (CUR_DMA)		; HL = src (CUR_DMA)
+	LD	BC, 128
+	LDIR
+	POP	HL
+	POP	DE
+	POP	BC
+	RET
+
+	end
